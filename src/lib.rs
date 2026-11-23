@@ -1,10 +1,12 @@
 pub(crate) mod cache;
 pub(crate) mod codec;
+pub mod compact;
 pub mod error;
 pub(crate) mod format;
 pub(crate) mod lock;
 pub(crate) mod store;
 
+pub use compact::{CompactOptions, CompactStats, compact};
 pub use error::{Error, Result};
 
 /// Default and per-connection configuration for the `sqmicro` SQLite VFS.
