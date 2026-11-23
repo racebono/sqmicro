@@ -1,0 +1,24 @@
+[package]
+name = "sqmicro"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Live-compressed SQLite VFS with pass-through WAL/SHM and chunk-grouped copy-on-write storage"
+
+[dependencies]
+libsqlite3-sys = "0.38"
+zstd-sys = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tempfile = "3.27"
