@@ -369,11 +369,24 @@ fn generate_race(conn: &Connection, minutes: f64) {
 }
 
 fn replay_real_db(src_path: &Path, dst: &Connection) {
-    let src = Connection::open_with_flags(
-        src_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .unwrap();
+    let mut wal_os = src_path.as_os_str().to_owned();
+    wal_os.push("-wal");
+    let wal_empty = std::fs::metadata(wal_os).map_or(true, |m| m.len() == 0);
+    let src = if wal_empty {
+        Connection::open_with_flags(
+            format!("{}?immutable=1", uri(src_path).unwrap()),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap()
+    } else {
+        Connection::open_with_flags(
+            src_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap()
+    };
     let ddl: Vec<String> = src
         .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, rowid")
         .unwrap()
