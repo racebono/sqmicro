@@ -754,6 +754,10 @@ impl<B: BlockIo> PageStore<B> {
         self.io
     }
 
+    pub(crate) fn io_mut(&mut self) -> &mut B {
+        &mut self.io
+    }
+
     fn current_geometry(&self) -> (u32, u64) {
         if self.has_pending_writes() || self.staged_page_size != 0 {
             (self.staged_page_size, self.staged_page_count)

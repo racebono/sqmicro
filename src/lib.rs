@@ -5,9 +5,11 @@ pub mod error;
 pub(crate) mod format;
 pub(crate) mod lock;
 pub(crate) mod store;
+mod vfs;
 
 pub use compact::{CompactOptions, CompactStats, compact};
 pub use error::{Error, Result};
+pub use vfs::{VFS_NAME, register, register_with, uri};
 
 /// Default and per-connection configuration for the `sqmicro` SQLite VFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
