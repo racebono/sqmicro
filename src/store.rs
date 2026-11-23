@@ -314,9 +314,28 @@ impl<B: BlockIo> PageStore<B> {
                     is_valid_page_size(len).then_some(len)
                 })
                 .ok_or_else(|| {
-                    Error::Corrupt(format!("cannot determine valid SQLite page_size from {} bytes", data.len()))
+                    Error::Corrupt(format!(
+                        "cannot determine valid SQLite page_size from {} bytes",
+                        data.len()
+                    ))
                 })?;
             self.staged_page_size = ps;
+        } else if offset == 0
+            && let Some(new_ps) = parse_sqlite_page_size(data)
+            && new_ps != self.staged_page_size
+            && data.len() % new_ps as usize == 0
+        {
+            // PRAGMA page_size = N; VACUUM; rewrites the database starting at offset 0 with a new page size.
+            self.pending_writes.clear();
+            self.pending_bytes = 0;
+            self.dirty_l2.clear();
+            self.l1.clear();
+            self.l2_cache.clear();
+            self.chunk_cache.clear();
+            self.staged_page_size = new_ps;
+            self.staged_page_count = 0;
+            self.staged_live_bytes = 0;
+            self.has_unflushed_spills = true;
         }
 
         let ps = self.staged_page_size as usize;
@@ -378,14 +397,15 @@ impl<B: BlockIo> PageStore<B> {
         let mut tail = self.staged_tail_offset;
         let mut live_bytes = self.staged_live_bytes;
 
-        // Write immutable copies of all dirty L2 pages in deterministic order.
+        // Write immutable copies of all dirty L2 pages in deterministic order without mutating
+        // `self.dirty_l2` or `self.l2_cache` until disk writes and superblock publication succeed.
         let mut dirty_indices: Vec<u32> = self.dirty_l2.keys().copied().collect();
         dirty_indices.sort_unstable();
-        for l2_idx in dirty_indices {
-            let page = self.dirty_l2.remove(&l2_idx).unwrap();
+        for &l2_idx in &dirty_indices {
             if (l2_idx as usize) >= l1_entries {
                 continue;
             }
+            let page = &self.dirty_l2[&l2_idx];
             let (l2_off, next_tail) = alloc_offset(tail, L2_PAGE_SIZE as u64)?;
             let encoded = page.encode();
             self.io.write_at(l2_off, &encoded)?;
@@ -394,7 +414,6 @@ impl<B: BlockIo> PageStore<B> {
                 live_bytes = live_bytes.saturating_add(L2_PAGE_SIZE as u64);
             }
             new_l1[l2_idx as usize] = l2_off;
-            self.l2_cache.insert(l2_idx, page, L2_PAGE_SIZE);
         }
 
         // Write immutable L1 root.
@@ -419,7 +438,7 @@ impl<B: BlockIo> PageStore<B> {
 
         let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
         let prev_compact = self.superblock.as_ref().map_or(0, |sb| sb.compact_id);
-        let (header_len, sqlite_header) = if let Some(hdr) = self.staged_header.take() {
+        let (header_len, sqlite_header) = if let Some(hdr) = self.staged_header {
             (100, hdr)
         } else if let Some(sb) = &self.superblock {
             (sb.header_len, sb.sqlite_header)
@@ -452,6 +471,15 @@ impl<B: BlockIo> PageStore<B> {
             self.io.sync()?;
         }
 
+        // Disk publication succeeded: now commit in-memory state.
+        for l2_idx in dirty_indices {
+            if let Some(page) = self.dirty_l2.remove(&l2_idx)
+                && (l2_idx as usize) < l1_entries
+            {
+                self.l2_cache.insert(l2_idx, page, L2_PAGE_SIZE);
+            }
+        }
+        self.staged_header = None;
         self.staged_tail_offset = tail;
         self.staged_live_bytes = sb.live_bytes;
         self.l1 = new_l1;
@@ -540,9 +568,11 @@ impl<B: BlockIo> PageStore<B> {
         let physical_data = self.staged_tail_offset.saturating_sub(SUPERBLOCK_REGION);
         let dead_bytes = physical_data.saturating_sub(exact_live_bytes);
 
+        let live_uncompressed_bytes = new_page_count.saturating_mul(ps_u64);
         let should_live_compact = (new_page_count == 0 && physical_data > 0)
             || (self.config.compact_threshold > 0
                 && exact_live_bytes <= 16 * 1024 * 1024
+                && live_uncompressed_bytes <= 64 * 1024 * 1024
                 && dead_bytes >= 4 * 1024 * 1024
                 && dead_bytes.saturating_mul(100)
                     >= physical_data.saturating_mul(self.config.compact_threshold as u64));
@@ -598,12 +628,13 @@ impl<B: BlockIo> PageStore<B> {
             (0, [0u8; 100])
         };
 
+        let effective_page_size = if new_page_count == 0 { 0 } else { page_size };
         let sb = Superblock {
             format_version: crate::format::FORMAT_VERSION,
             flags: 0,
             generation: prev_gen + 1,
-            page_size,
-            chunk_max_pages: self.chunk_pages_limit(page_size) as u32,
+            page_size: effective_page_size,
+            chunk_max_pages: self.chunk_pages_limit(effective_page_size) as u32,
             page_count: new_page_count,
             tail_offset: tail,
             live_bytes: exact_live_bytes.min(tail.saturating_sub(SUPERBLOCK_REGION)),
@@ -621,6 +652,7 @@ impl<B: BlockIo> PageStore<B> {
         for idx in new_l1_entries..self.l1.len() {
             self.l2_cache.remove(&(idx as u32));
         }
+        self.staged_page_size = effective_page_size;
         self.staged_page_count = new_page_count;
         self.staged_tail_offset = tail;
         self.staged_live_bytes = sb.live_bytes;
@@ -709,12 +741,13 @@ impl<B: BlockIo> PageStore<B> {
 
         self.io.sync()?;
 
+        let effective_page_size = if new_page_count == 0 { 0 } else { page_size };
         let sb = Superblock {
             format_version: crate::format::FORMAT_VERSION,
             flags: 0,
             generation: prev_gen + 1,
-            page_size,
-            chunk_max_pages: self.chunk_pages_limit(page_size) as u32,
+            page_size: effective_page_size,
+            chunk_max_pages: self.chunk_pages_limit(effective_page_size) as u32,
             page_count: new_page_count,
             tail_offset: tail,
             live_bytes: live_bytes.min(tail.saturating_sub(SUPERBLOCK_REGION)),
@@ -734,6 +767,7 @@ impl<B: BlockIo> PageStore<B> {
         self.io.truncate(tail)?;
         self.io.sync()?;
 
+        self.staged_page_size = effective_page_size;
         self.staged_tail_offset = tail;
         self.staged_live_bytes = sb.live_bytes;
         self.l1 = new_l1;
@@ -785,15 +819,23 @@ impl<B: BlockIo> PageStore<B> {
         if self.pending_writes.is_empty() {
             return Ok(());
         }
+
+        // On a brand-new 0-byte DB, publish a valid empty superblock before writing chunks at
+        // 0x2000 so concurrent readers never observe file_len > 0 with an all-zero superblock.
+        if self.superblock.is_none() {
+            let mut init_sb = Superblock::empty();
+            init_sb.generation = 1;
+            self.io.write_at(init_sb.slot_offset(), &init_sb.encode())?;
+            self.superblock = Some(init_sb);
+        }
+
         let page_size = self.staged_page_size;
         let max_pages = self.chunk_pages_limit(page_size);
-        let pending = std::mem::take(&mut self.pending_writes);
-        self.pending_bytes = 0;
 
-        // Build ChunkInput groups: page 1 always isolated & raw; pages >= 2 grouped in contiguous runs.
+        // Build ChunkInput groups without clearing pending_writes until disk writes succeed.
         let mut inputs: Vec<ChunkInput> = Vec::new();
         let mut current: Vec<(u64, Vec<u8>)> = Vec::new();
-        for (pgno, data) in pending {
+        for (&pgno, data) in &self.pending_writes {
             if pgno == 1 {
                 if !current.is_empty() {
                     inputs.push(ChunkInput {
@@ -802,7 +844,7 @@ impl<B: BlockIo> PageStore<B> {
                     });
                 }
                 inputs.push(ChunkInput {
-                    pages: vec![(1, data)],
+                    pages: vec![(1, data.clone())],
                     force_raw: true,
                 });
                 continue;
@@ -816,7 +858,7 @@ impl<B: BlockIo> PageStore<B> {
                     force_raw: false,
                 });
             }
-            current.push((pgno, data));
+            current.push((pgno, data.clone()));
         }
         if !current.is_empty() {
             inputs.push(ChunkInput {
@@ -828,6 +870,10 @@ impl<B: BlockIo> PageStore<B> {
         let encoded_chunks =
             compress_chunks_parallel(inputs, self.config.level, self.config.threads)?;
 
+        let mut next_tail = self.staged_tail_offset;
+        let mut added_live_bytes = 0u64;
+        let mut staged_entries: Vec<(u64, DirEntry)> = Vec::new();
+
         for chunk in encoded_chunks {
             let page_count = u8::try_from(chunk.pagenos.len())
                 .map_err(|_| Error::Corrupt("chunk page_count overflow".into()))?;
@@ -836,7 +882,7 @@ impl<B: BlockIo> PageStore<B> {
             let total_unaligned = CHUNK_HEADER_SIZE + chunk.payload.len();
             let aligned_len = align16(total_unaligned as u64);
 
-            let (chunk_off, next_tail) = alloc_offset(self.staged_tail_offset, aligned_len)?;
+            let (chunk_off, new_tail) = alloc_offset(next_tail, aligned_len)?;
             let hdr = ChunkHeader {
                 codec: chunk.codec,
                 page_count,
@@ -849,15 +895,32 @@ impl<B: BlockIo> PageStore<B> {
             disk_buf[CHUNK_HEADER_SIZE..total_unaligned].copy_from_slice(&chunk.payload);
             self.io.write_at(chunk_off, &disk_buf)?;
 
-            self.staged_tail_offset = next_tail;
-            self.staged_live_bytes = self.staged_live_bytes.saturating_add(aligned_len);
+            next_tail = new_tail;
+            added_live_bytes = added_live_bytes.saturating_add(aligned_len);
 
             for (slot_idx, pgno) in chunk.pagenos.into_iter().enumerate() {
                 let entry = DirEntry::new(chunk_off, total_unaligned, slot_idx as u8)?;
-                self.set_dirty_dir_entry(pgno, entry)?;
+                staged_entries.push((pgno, entry));
             }
         }
 
+        // All disk writes succeeded: now apply staged directory updates and clear pending_writes.
+        let mut updated_l2 = self.dirty_l2.clone();
+        for (pgno, entry) in staged_entries {
+            let idx = pgno - 1;
+            let l2_idx = (idx / L2_ENTRIES as u64) as u32;
+            let slot = (idx % L2_ENTRIES as u64) as usize;
+            if !updated_l2.contains_key(&l2_idx) {
+                let base = self.load_committed_l2(l2_idx)?;
+                updated_l2.insert(l2_idx, base);
+            }
+            updated_l2.get_mut(&l2_idx).unwrap().entries[slot] = entry;
+        }
+        self.dirty_l2 = updated_l2;
+        self.staged_tail_offset = next_tail;
+        self.staged_live_bytes = self.staged_live_bytes.saturating_add(added_live_bytes);
+        self.pending_writes.clear();
+        self.pending_bytes = 0;
         self.has_unflushed_spills = true;
         Ok(())
     }
@@ -1264,5 +1327,137 @@ mod tests {
         assert_eq!(writer.logical_size().unwrap(), page_size as u64);
         assert!(std::fs::metadata(&path).unwrap().len() >= before_size);
         r_lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn reader_can_open_and_refresh_during_initial_16mib_spill() {
+        let mem = MemBlockIo::shared();
+        let mut writer = PageStore::open(mem.clone(), Config::default(), false).unwrap();
+        let mut reader = PageStore::open(mem.clone(), Config::default(), true).unwrap();
+
+        let page_size = 16384usize;
+        let mut p1 = vec![0u8; page_size];
+        p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        writer.write(0, &p1).unwrap();
+        // >16 MiB before flush -> triggers initial spill on a brand-new 0-byte DB.
+        for pgno in 2..=1100u64 {
+            let mut page = vec![(pgno % 251) as u8; page_size];
+            page[..8].copy_from_slice(&pgno.to_le_bytes());
+            writer.write((pgno - 1) * page_size as u64, &page).unwrap();
+        }
+        assert!(mem.len() > 8192);
+
+        // Concurrent reader refreshing OR freshly opening mid-spill must NOT fail with NotASqmicroDb!
+        reader.refresh().unwrap();
+        assert_eq!(reader.logical_size().unwrap(), 0);
+        let mut fresh_reader = PageStore::open(mem.clone(), Config::default(), true).unwrap();
+        assert_eq!(fresh_reader.logical_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_flush_preserves_dirty_state_for_successful_retry() {
+        #[derive(Clone)]
+        struct FaultyIo {
+            inner: MemBlockIo,
+            fail_sync: Rc<RefCell<bool>>,
+        }
+        impl BlockIo for FaultyIo {
+            fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                self.inner.read_at(offset, buf)
+            }
+            fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+                self.inner.write_at(offset, buf)
+            }
+            fn sync(&mut self) -> Result<()> {
+                if *self.fail_sync.borrow() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected sync fault").into());
+                }
+                Ok(())
+            }
+            fn file_size(&mut self) -> Result<u64> {
+                self.inner.file_size()
+            }
+            fn truncate(&mut self, size: u64) -> Result<()> {
+                self.inner.truncate(size)
+            }
+        }
+
+        let inner = MemBlockIo::shared();
+        let fail_sync = Rc::new(RefCell::new(true));
+        let io = FaultyIo {
+            inner: inner.clone(),
+            fail_sync: fail_sync.clone(),
+        };
+        let mut writer = PageStore::open(io, Config::default(), false).unwrap();
+        let page_size = 4096usize;
+        let mut p1 = vec![0u8; page_size];
+        p1[..16].copy_from_slice(b"SQLite format 3\0");
+        p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        p1[24..28].copy_from_slice(&99u32.to_be_bytes());
+        writer.write(0, &p1).unwrap();
+        writer.write(page_size as u64, &vec![0x77u8; page_size]).unwrap();
+
+        // First flush fails on sync.
+        assert!(writer.flush(true).is_err());
+        // Clear fault and retry: all dirty L2 pages and header must still publish cleanly!
+        *fail_sync.borrow_mut() = false;
+        writer.flush(true).unwrap();
+
+        let mut reader = PageStore::open(inner, Config::default(), true).unwrap();
+        assert_eq!(reader.logical_size().unwrap(), 2 * page_size as u64);
+        let mut hdr = [0u8; 4];
+        reader.read(24, &mut hdr).unwrap();
+        assert_eq!(u32::from_be_bytes(hdr), 99);
+        let mut p2 = vec![0u8; page_size];
+        reader.read(page_size as u64, &mut p2).unwrap();
+        assert_eq!(p2, vec![0x77u8; page_size]);
+    }
+
+    #[test]
+    fn live_compaction_skips_when_uncompressed_size_exceeds_ram_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_compressible.db");
+        let writer_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
+        let lock = crate::lock::CompactLock::open(&path).unwrap();
+
+        // Write 4200 highly compressible pages (~67 MiB uncompressed, <1 MiB compressed)
+        // plus 320 incompressible pages (~5.2 MiB) at the end, then truncate off the 320 incompressible pages.
+        // Remaining live pages: 4200 * 16 KiB = 67.2 MiB > 64 MiB uncompressed RAM cap -> must NOT live-compact!
+        let page_size = 16384usize;
+        let mut p1 = vec![0u8; page_size];
+        p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        writer.write(0, &p1).unwrap();
+        let zeros = vec![0x11u8; page_size];
+        for pgno in 2..=4200u64 {
+            writer.write((pgno - 1) * page_size as u64, &zeros).unwrap();
+        }
+        let mut x = 0x1122_3344_5566_7788u64;
+        for pgno in 4201..=4520u64 {
+            let buf: Vec<u8> = (0..page_size)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            writer.write((pgno - 1) * page_size as u64, &buf).unwrap();
+        }
+        writer.flush(true).unwrap();
+        let compact_id_before = writer.superblock().unwrap().compact_id;
+
+        writer.truncate(4200 * page_size as u64, Some(&lock)).unwrap();
+        assert_eq!(
+            writer.superblock().unwrap().compact_id,
+            compact_id_before,
+            "live compaction must skip when live uncompressed bytes exceed 64 MiB"
+        );
     }
 }

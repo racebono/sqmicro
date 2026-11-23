@@ -130,6 +130,19 @@ impl CompactLock {
             Err(err.into())
         }
     }
+
+    pub fn lock_shared_guard(&self) -> Result<SharedLockGuard<'_>> {
+        self.lock_shared()?;
+        Ok(SharedLockGuard(self))
+    }
+}
+
+pub struct SharedLockGuard<'a>(&'a CompactLock);
+
+impl Drop for SharedLockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 #[cfg(test)]

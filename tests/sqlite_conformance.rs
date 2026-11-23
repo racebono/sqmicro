@@ -279,3 +279,153 @@ fn compact_api_roundtrip_after_wal_checkpoint() {
     assert_eq!(cnt, 6000);
     assert!(sum > 0.0);
 }
+
+#[test]
+fn pragma_page_size_change_with_vacuum_works_both_directions() {
+    register().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("resize.db");
+
+    {
+        let conn = open_rw(&db, "").unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size = 16384;
+             PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+             INSERT INTO t SELECT i, 'row-' || i FROM n;
+             PRAGMA page_size = 4096;
+             VACUUM;",
+        )
+        .unwrap();
+        check_integrity(&conn);
+        let ps: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        assert_eq!(ps, 4096);
+
+        conn.execute_batch("PRAGMA page_size = 16384; VACUUM;").unwrap();
+        check_integrity(&conn);
+        let ps2: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        assert_eq!(ps2, 16384);
+    }
+
+    let ro = open_ro(&db).unwrap();
+    check_integrity(&ro);
+    let (ps, cnt): (i64, i64) = ro
+        .query_row(
+            "SELECT (SELECT page_size FROM pragma_page_size), (SELECT count(*) FROM t)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((ps, cnt), (16384, 1000));
+}
+
+#[test]
+fn open_without_uri_flag_uses_default_config_safely() {
+    register().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("no_uri.db");
+
+    {
+        let conn = Connection::open_with_flags_and_vfs(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            VFS_NAME,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE t (id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (1), (2), (3);",
+        )
+        .unwrap();
+    }
+
+    let ro = Connection::open_with_flags_and_vfs(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        VFS_NAME,
+    )
+    .unwrap();
+    check_integrity(&ro);
+    let cnt: i64 = ro.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(cnt, 3);
+}
+
+#[test]
+fn concurrent_open_and_rollback_reads_during_live_compaction_do_not_corrupt() {
+    register().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("compact_race.db");
+
+    // Pre-populate >4 MiB of incompressible data in WAL mode.
+    let writer = open_rw(&db, "").unwrap();
+    writer.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA page_size = 16384;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE blobs (id INTEGER PRIMARY KEY, b BLOB);",
+        )
+        .unwrap();
+
+    let mut rng = 0xfeed_face_dead_beefu64;
+    let mut make_blob = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as u8
+            })
+            .collect()
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let db_reader = db.clone();
+    let stop_reader = stop.clone();
+    let reader_thread = std::thread::spawn(move || {
+        // Repeatedly open fresh connections & query while writer triggers live compaction cycles.
+        for _ in 0..80 {
+            if stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(conn) = open_ro(&db_reader) {
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+                if let Err(e) = conn.query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0)) {
+                    let code = e.sqlite_error_code();
+                    assert!(
+                        matches!(
+                            code,
+                            Some(rusqlite::ErrorCode::DatabaseBusy)
+                                | Some(rusqlite::ErrorCode::DatabaseLocked)
+                        ),
+                        "reader hit fatal error during live compaction: {e}"
+                    );
+                }
+            }
+        }
+    });
+
+    for _round in 0..3 {
+        let tx = writer.unchecked_transaction().unwrap();
+        {
+            let mut ins = tx.prepare("INSERT INTO blobs (b) VALUES (?1)").unwrap();
+            for _ in 0..350 {
+                ins.execute([make_blob(15_000)]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+        writer
+            .execute_batch("DELETE FROM blobs; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    reader_thread.join().unwrap();
+    check_integrity(&writer);
+}

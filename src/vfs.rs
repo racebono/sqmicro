@@ -355,8 +355,22 @@ struct SqmicroFileState {
 impl SqmicroFileState {
     #[inline]
     fn os_file_ptr(&mut self) -> *mut ffi::sqlite3_file {
-        // Safety: we only borrow the embedded OsFileBlockIo via PageStore's public accessor below.
         self.store.io_mut().as_file_ptr()
+    }
+}
+
+fn c_path_to_pathbuf(z_name: *const c_char) -> Result<std::path::PathBuf> {
+    let bytes = unsafe { CStr::from_ptr(z_name).to_bytes() };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = std::str::from_utf8(bytes)
+            .map_err(|_| Error::InvalidPath("database path is not valid UTF-8".into()))?;
+        Ok(std::path::PathBuf::from(s))
     }
 }
 
@@ -370,23 +384,33 @@ fn err_to_sqlite(err: Error, default_ioerr: c_int) -> c_int {
     }
 }
 
-fn parse_uri_config(z_name: *const c_char, defaults: Config) -> Config {
+fn parse_uri_config(z_name: *const c_char, flags: c_int, defaults: Config) -> Config {
+    if (flags & ffi::SQLITE_OPEN_URI) == 0 {
+        return defaults;
+    }
     let mut cfg = defaults;
     unsafe {
-        cfg.level = ffi::sqlite3_uri_int64(z_name, c"level".as_ptr(), cfg.level as i64) as i32;
+        let level = ffi::sqlite3_uri_int64(z_name, c"level".as_ptr(), cfg.level as i64);
+        if let Ok(v) = i32::try_from(level) {
+            cfg.level = v;
+        }
         let chunk_kib =
             ffi::sqlite3_uri_int64(z_name, c"chunk_kib".as_ptr(), cfg.chunk_kib as i64);
-        if chunk_kib > 0 {
-            cfg.chunk_kib = chunk_kib as usize;
+        if let Ok(v) = usize::try_from(chunk_kib)
+            && v > 0
+        {
+            cfg.chunk_kib = v;
         }
         let cache_mib =
             ffi::sqlite3_uri_int64(z_name, c"cache_mib".as_ptr(), cfg.cache_mib as i64);
-        if cache_mib >= 0 {
-            cfg.cache_mib = cache_mib as usize;
+        if let Ok(v) = usize::try_from(cache_mib) {
+            cfg.cache_mib = v;
         }
         let threads = ffi::sqlite3_uri_int64(z_name, c"threads".as_ptr(), cfg.threads as i64);
-        if threads >= 1 {
-            cfg.threads = threads as usize;
+        if let Ok(v) = usize::try_from(threads)
+            && v >= 1
+        {
+            cfg.threads = v;
         }
         let compact_threshold = ffi::sqlite3_uri_int64(
             z_name,
@@ -445,7 +469,7 @@ unsafe extern "C" fn vfs_open(
             return ((*wrapped).xOpen.unwrap())(wrapped, z_name, p_file, flags, p_out_flags);
         }
 
-        let cfg = parse_uri_config(z_name, vfs.defaults);
+        let cfg = parse_uri_config(z_name, flags, vfs.defaults);
         let read_only = (flags & ffi::SQLITE_OPEN_READONLY) != 0;
 
         let mut os_io = OsFileBlockIo::new((*wrapped).szOsFile as usize);
@@ -462,10 +486,34 @@ unsafe extern "C" fn vfs_open(
         }
         os_io.closed = false;
 
-        let path_str = CStr::from_ptr(z_name).to_string_lossy();
-        let compact_lock = CompactLock::open(Path::new(path_str.as_ref())).ok();
+        let path = match c_path_to_pathbuf(z_name) {
+            Ok(p) => p,
+            Err(e) => {
+                (*p_file).pMethods = std::ptr::null();
+                return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
+            }
+        };
+        let compact_lock = match CompactLock::open(&path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                (*p_file).pMethods = std::ptr::null();
+                return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
+            }
+        };
 
-        let store = match PageStore::open(os_io, cfg, read_only) {
+        // Hold shared CompactLock while reading initial superblock + L1 root so a concurrent
+        // live_compact_to cannot overwrite or truncate offsets beneath PageStore::open.
+        let open_res = {
+            let _guard = match compact_lock.lock_shared_guard() {
+                Ok(g) => g,
+                Err(e) => {
+                    (*p_file).pMethods = std::ptr::null();
+                    return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
+                }
+            };
+            PageStore::open(os_io, cfg, read_only)
+        };
+        let store = match open_res {
             Ok(store) => store,
             Err(e) => {
                 drop(compact_lock);
@@ -476,7 +524,7 @@ unsafe extern "C" fn vfs_open(
 
         let state = Box::new(SqmicroFileState {
             store,
-            compact_lock,
+            compact_lock: Some(compact_lock),
             shared_lock_count: 0,
             read_only,
         });
@@ -627,8 +675,24 @@ unsafe extern "C" fn io_read(
         if i_amt < 0 || i_ofst < 0 {
             return ffi::SQLITE_IOERR_READ;
         }
+        if i_amt == 0 {
+            return ffi::SQLITE_OK;
+        }
+        if z_buf.is_null() {
+            return ffi::SQLITE_IOERR_READ;
+        }
         let buf = std::slice::from_raw_parts_mut(z_buf.cast::<u8>(), i_amt as usize);
         let state = state_mut(p_file);
+        // Guard pre-SHM and rollback-mode reads against concurrent live compaction.
+        let _guard = if state.shared_lock_count == 0 {
+            match state.compact_lock.as_ref().map(|l| l.lock_shared_guard()) {
+                Some(Ok(g)) => Some(g),
+                Some(Err(e)) => return err_to_sqlite(e, ffi::SQLITE_IOERR_READ),
+                None => None,
+            }
+        } else {
+            None
+        };
         match state.store.read(i_ofst as u64, buf) {
             Ok(ReadOutcome::Full) => ffi::SQLITE_OK,
             Ok(ReadOutcome::ShortRead) => ffi::SQLITE_IOERR_SHORT_READ,
@@ -646,6 +710,12 @@ unsafe extern "C" fn io_write(
 ) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         if i_amt < 0 || i_ofst < 0 {
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+        if i_amt == 0 {
+            return ffi::SQLITE_OK;
+        }
+        if z_buf.is_null() {
             return ffi::SQLITE_IOERR_WRITE;
         }
         let data = std::slice::from_raw_parts(z_buf.cast::<u8>(), i_amt as usize);
@@ -692,10 +762,19 @@ unsafe extern "C" fn io_file_size(
 ) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
-        if !state.store.has_pending_writes()
-            && let Err(e) = state.store.refresh()
-        {
-            return err_to_sqlite(e, ffi::SQLITE_IOERR_FSTAT);
+        if !state.store.has_pending_writes() {
+            let _guard = if state.shared_lock_count == 0 {
+                match state.compact_lock.as_ref().map(|l| l.lock_shared_guard()) {
+                    Some(Ok(g)) => Some(g),
+                    Some(Err(e)) => return err_to_sqlite(e, ffi::SQLITE_IOERR_FSTAT),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let Err(e) = state.store.refresh() {
+                return err_to_sqlite(e, ffi::SQLITE_IOERR_FSTAT);
+            }
         }
         match state.store.logical_size() {
             Ok(sz) => {
@@ -713,7 +792,19 @@ unsafe extern "C" fn io_lock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c
         let state = state_mut(p_file);
         let os_p = state.os_file_ptr();
         let rc = ((*(*os_p).pMethods).xLock.unwrap())(os_p, e_lock);
-        if rc == ffi::SQLITE_OK && e_lock == ffi::SQLITE_LOCK_SHARED && !state.store.has_pending_writes() {
+        if rc == ffi::SQLITE_OK
+            && e_lock == ffi::SQLITE_LOCK_SHARED
+            && !state.store.has_pending_writes()
+        {
+            let _guard = if state.shared_lock_count == 0 {
+                match state.compact_lock.as_ref().map(|l| l.lock_shared_guard()) {
+                    Some(Ok(g)) => Some(g),
+                    Some(Err(e)) => return err_to_sqlite(e, ffi::SQLITE_IOERR_READ),
+                    None => None,
+                }
+            } else {
+                None
+            };
             if let Err(e) = state.store.refresh() {
                 return err_to_sqlite(e, ffi::SQLITE_IOERR_READ);
             }
@@ -924,4 +1015,17 @@ unsafe extern "C" fn io_shm_unmap(p_file: *mut ffi::sqlite3_file, delete_flag: c
         }
     }));
     res.unwrap_or(ffi::SQLITE_INTERNAL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_length_read_and_write_with_null_ptr_return_ok() {
+        unsafe {
+            assert_eq!(io_read(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0), ffi::SQLITE_OK);
+            assert_eq!(io_write(std::ptr::null_mut(), std::ptr::null(), 0, 0), ffi::SQLITE_OK);
+        }
+    }
 }
