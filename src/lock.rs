@@ -39,19 +39,10 @@ impl CompactLock {
             }
             Ok(())
         }
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         {
-            use std::os::unix::io::AsRawFd;
-            loop {
-                let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH) };
-                if rc == 0 {
-                    return Ok(());
-                }
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err.into());
-                }
-            }
+            self.file.lock_shared()?;
+            Ok(())
         }
     }
 
@@ -72,13 +63,9 @@ impl CompactLock {
             }
             Ok(())
         }
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         {
-            use std::os::unix::io::AsRawFd;
-            let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            self.file.unlock()?;
             Ok(())
         }
     }
@@ -116,18 +103,13 @@ impl CompactLock {
             }
             Err(err.into())
         }
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         {
-            use std::os::unix::io::AsRawFd;
-            let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return Ok(true);
+            match self.file.try_lock() {
+                Ok(()) => Ok(true),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+                Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
             }
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(false);
-            }
-            Err(err.into())
         }
     }
 
