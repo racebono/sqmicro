@@ -299,12 +299,13 @@ mod tests {
 
     #[test]
     fn parallel_compression_preserves_order_and_contents() {
-        let inputs: Vec<ChunkInput> = (0..8)
-            .map(|i| ChunkInput {
-                pages: vec![
-                    (i + 1, vec![i as u8; 8192]),
-                    (i + 2, vec![(i + 10) as u8; 8192]),
-                ],
+        let pages: Vec<[Vec<u8>; 2]> = (0..8u8)
+            .map(|i| [vec![i; 8192], vec![i + 10; 8192]])
+            .collect();
+        let inputs: Vec<ChunkInput> = (0u64..)
+            .zip(&pages)
+            .map(|(i, [a, b])| ChunkInput {
+                pages: vec![(i + 1, a.as_slice()), (i + 2, b.as_slice())],
                 force_raw: i == 0,
             })
             .collect();
