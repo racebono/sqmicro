@@ -58,12 +58,13 @@ impl Compressor {
         Ok(this)
     }
 
-    pub fn compress(&mut self, raw: &[u8], force_raw: bool) -> Result<(ChunkCodec, Vec<u8>)> {
+    pub fn compress(&mut self, raw: Vec<u8>, force_raw: bool) -> Result<(ChunkCodec, Vec<u8>)> {
         if force_raw || raw.is_empty() {
-            return Ok((ChunkCodec::Raw, raw.to_vec()));
+            return Ok((ChunkCodec::Raw, raw));
         }
         let bound = unsafe { zstd_sys::ZSTD_compressBound(raw.len()) };
-        let mut out = vec![0u8; bound];
+
+        let mut out = Box::<[u8]>::new_uninit_slice(bound);
         let written = unsafe {
             zstd_sys::ZSTD_compress2(
                 self.cctx.as_ptr(),
@@ -73,13 +74,20 @@ impl Compressor {
                 raw.len(),
             )
         };
+
         if unsafe { zstd_sys::ZSTD_isError(written) } != 0 {
             return Err(Error::Zstd(zstd_err(written)));
         }
-        if written >= raw.len() {
-            return Ok((ChunkCodec::Raw, raw.to_vec()));
+
+        let out = unsafe {
+            let ptr = Box::into_raw(out);
+            Vec::<u8>::from_raw_parts(ptr.cast(), written, ptr.len())
+        };
+
+        if out.len() >= raw.len() {
+            return Ok((ChunkCodec::Raw, raw));
         }
-        out.truncate(written);
+
         Ok((ChunkCodec::Zstd, out))
     }
 }
@@ -179,7 +187,7 @@ fn encode_one(compressor: &mut Compressor, input: &ChunkInput) -> Result<Encoded
         pagenos.push(*pgno);
         raw.extend_from_slice(data);
     }
-    let (codec, payload) = compressor.compress(&raw, input.force_raw)?;
+    let (codec, payload) = compressor.compress(raw, input.force_raw)?;
     Ok(EncodedChunk {
         pagenos,
         codec,
@@ -245,7 +253,7 @@ mod tests {
     fn compressible_chunk_uses_zstd_and_roundtrips() {
         let raw = vec![0x42u8; 16 * 1024];
         let mut c = Compressor::new(3).unwrap();
-        let (codec, payload) = c.compress(&raw, false).unwrap();
+        let (codec, payload) = c.compress(raw.clone(), false).unwrap();
         assert_eq!(codec, ChunkCodec::Zstd);
         assert!(payload.len() < raw.len() / 10);
         let mut d = Decompressor::new().unwrap();
@@ -264,12 +272,12 @@ mod tests {
             })
             .collect();
         let mut c = Compressor::new(3).unwrap();
-        let (codec, payload) = c.compress(&raw, false).unwrap();
+        let (codec, payload) = c.compress(raw.clone(), false).unwrap();
         assert_eq!(codec, ChunkCodec::Raw);
         assert_eq!(payload, raw);
 
         let zeros = vec![0u8; 4096];
-        let (codec2, payload2) = c.compress(&zeros, true).unwrap();
+        let (codec2, payload2) = c.compress(zeros.clone(), true).unwrap();
         assert_eq!(codec2, ChunkCodec::Raw);
         assert_eq!(payload2, zeros);
     }
@@ -278,7 +286,7 @@ mod tests {
     fn bitflip_in_compressed_payload_fails_checksum_with_corrupt() {
         let raw: Vec<u8> = (0..16384).map(|i| (i % 97) as u8).collect();
         let mut c = Compressor::new(3).unwrap();
-        let (codec, mut payload) = c.compress(&raw, false).unwrap();
+        let (codec, mut payload) = c.compress(raw.clone(), false).unwrap();
         assert_eq!(codec, ChunkCodec::Zstd);
         let mid = payload.len() / 2;
         payload[mid] ^= 0x01;
