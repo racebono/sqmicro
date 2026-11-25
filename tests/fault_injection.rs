@@ -712,6 +712,32 @@ fn rollback_mode_commits_compact_the_file() {
 }
 
 #[test]
+fn failed_sync_in_exclusive_locking_mode_is_rolled_back_at_once() {
+    for journal in ["DELETE", "MEMORY", "OFF"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let conn = open(&db);
+        conn.execute_batch(&format!(
+            "PRAGMA locking_mode = EXCLUSIVE;
+             PRAGMA journal_mode = {journal};
+             CREATE TABLE t (v INTEGER);
+             INSERT INTO t VALUES (1);"
+        ))
+        .unwrap();
+        FAIL_NEXT_SYNC.set(true);
+        assert!(conn.execute_batch("UPDATE t SET v = 2").is_err());
+        assert!(!FAIL_NEXT_SYNC.take());
+        // SQLite never unlocks the file in this mode.
+        assert_eq!(int(&conn, "SELECT v FROM t"), 1, "{journal}");
+        conn.execute_batch("UPDATE t SET v = 3").unwrap();
+        drop(conn);
+        let reopened = open(&db);
+        assert_eq!(int(&reopened, "SELECT v FROM t"), 3);
+        assert_intact(&reopened);
+    }
+}
+
+#[test]
 fn failed_commit_does_not_leave_the_connection_unable_to_read() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("a.db");

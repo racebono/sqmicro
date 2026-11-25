@@ -419,6 +419,16 @@ impl<B: BlockIo> PageStore<B> {
     }
 
     pub fn flush(&mut self, sync_disk: bool) -> Result<()> {
+        let res = self.flush_staged(sync_disk);
+        if res.is_err() && self.spills_unsure {
+            // Pages spilled before a failed sync may never reach the disk, so they can't be published.
+            // Whoever wrote them has to write them again, from the WAL or the journal.
+            self.discard_staged();
+        }
+        res
+    }
+
+    fn flush_staged(&mut self, sync_disk: bool) -> Result<()> {
         if self.read_only {
             return Ok(());
         }
@@ -1996,13 +2006,24 @@ mod tests {
         io.0.borrow_mut().fail_sync = true;
         assert!(store.flush(true).is_err());
         io.0.borrow_mut().fail_sync = false;
-        // Their chunks may be gone, so there is no retry.
-        assert!(store.flush(true).is_err());
+        // Their chunks may be gone, so they are dropped, to be written again.
+        assert!(!store.has_pending_writes());
         let old: Vec<u64> = (1..=40).collect();
+        assert_eq!(contents(&mut store).unwrap(), old);
         assert_eq!(reopened(&io.0.borrow().durable), old);
 
-        // What SQLite does next: roll back, then write the pages again.
-        store.discard_staged();
+        // Also if they were spilled before a sync that wasn't part of a flush.
+        for pgno in 1..=40 {
+            put(&mut store, pgno, 100 + pgno);
+        }
+        store.spill_pending_chunks().unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(store.sync().is_err());
+        io.0.borrow_mut().fail_sync = false;
+        assert!(store.flush(true).is_err());
+        assert!(!store.has_pending_writes());
+        assert_eq!(contents(&mut store).unwrap(), old);
+
         for pgno in 1..=40 {
             put(&mut store, pgno, 200 + pgno);
         }
