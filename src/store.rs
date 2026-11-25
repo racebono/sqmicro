@@ -833,7 +833,7 @@ impl<B: BlockIo> PageStore<B> {
 
         // Build ChunkInput groups without clearing pending_writes until disk writes succeed.
         let mut inputs: Vec<ChunkInput> = Vec::new();
-        let mut current: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut current: Vec<(u64, &[u8])> = Vec::new();
         for (&pgno, data) in &self.pending_writes {
             if pgno == 1 {
                 if !current.is_empty() {
@@ -843,7 +843,7 @@ impl<B: BlockIo> PageStore<B> {
                     });
                 }
                 inputs.push(ChunkInput {
-                    pages: vec![(1, data.clone())],
+                    pages: vec![(1, data)],
                     force_raw: true,
                 });
                 continue;
@@ -857,7 +857,7 @@ impl<B: BlockIo> PageStore<B> {
                     force_raw: false,
                 });
             }
-            current.push((pgno, data.clone()));
+            current.push((pgno, data));
         }
         if !current.is_empty() {
             inputs.push(ChunkInput {

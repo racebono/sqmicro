@@ -167,8 +167,8 @@ impl Decompressor {
     }
 }
 
-pub struct ChunkInput {
-    pub pages: Vec<(u64, Vec<u8>)>,
+pub struct ChunkInput<'a> {
+    pub pages: Vec<(u64, &'a [u8])>,
     pub force_raw: bool,
 }
 
