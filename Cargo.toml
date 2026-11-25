@@ -6,6 +6,7 @@ license = "MIT"
 description = "Live-compressed SQLite VFS with pass-through WAL/SHM and chunk-grouped copy-on-write storage"
 
 [dependencies]
+crc32fast = "1.5"
 libsqlite3-sys = "0.38"
 zstd-sys = "2.0"
 

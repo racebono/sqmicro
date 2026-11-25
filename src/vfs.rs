@@ -378,7 +378,7 @@ fn err_to_sqlite(err: Error, default_ioerr: c_int) -> c_int {
     match err {
         Error::Sqlite { code, .. } => code,
         Error::Corrupt(_) | Error::Zstd(_) => ffi::SQLITE_CORRUPT,
-        Error::NotASqmicroDb => ffi::SQLITE_NOTADB,
+        Error::NotASqmicroDb | Error::UnsupportedVersion(_) => ffi::SQLITE_NOTADB,
         Error::InvalidConfig(_) | Error::InvalidPath(_) => ffi::SQLITE_CANTOPEN,
         Error::Io(_) => default_ioerr,
     }
