@@ -103,6 +103,14 @@ impl Superblock {
         }
     }
 
+    /// The first superblock of every file.
+    pub fn initial() -> Self {
+        Self {
+            generation: 1,
+            ..Self::empty()
+        }
+    }
+
     #[inline]
     pub fn slot_offset(&self) -> u64 {
         if self.generation & 1 == 0 {
@@ -231,6 +239,17 @@ impl Superblock {
                 && slot[8..12] == FORMAT_VERSION.to_le_bytes()
                 && Self::decode(slot.try_into().unwrap()).is_none()
         })
+    }
+
+    /// Whether this is what a crash while writing `initial()` can leave: any part of it, or nothing.
+    pub fn is_unfinished_initial(region: &[u8; SUPERBLOCK_REGION as usize]) -> bool {
+        let initial = Self::initial();
+        let (before, slot) = region.split_at(initial.slot_offset() as usize);
+        before.iter().all(|&b| b == 0)
+            && slot
+                .iter()
+                .zip(initial.encode())
+                .all(|(&b, want)| b == 0 || b == want)
     }
 
     /// Format version claimed by a sqmicro file this build cannot read. Only meaningful

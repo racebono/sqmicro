@@ -352,12 +352,17 @@ struct SqmicroFileState {
     store: PageStore<OsFileBlockIo>,
     compact_lock: Option<CompactLock>,
     shared_lock_count: u32,
-    /// Main database lock held, as `SQLITE_LOCK_*`.
-    lock_level: c_int,
     /// First region of the WAL index, while mapped.
     wal_index: *mut c_void,
-    /// `nBackfill` from before a checkpoint whose flush failed.
-    backfill_to_restore: Option<u32>,
+    /// A checkpoint whose flush failed, until SQLite has been told.
+    failed_checkpoint: Option<FailedCheckpoint>,
+}
+
+struct FailedCheckpoint {
+    /// Result of the flush.
+    rc: c_int,
+    /// `nBackfill` before the checkpoint.
+    backfill: Option<u32>,
 }
 
 /// Offset of `nBackfill` in the WAL index (https://sqlite.org/walformat.html).
@@ -382,6 +387,14 @@ impl SqmicroFileState {
             let field = self.wal_index.cast::<u8>().add(WAL_INDEX_BACKFILL_OFFSET);
             Some(AtomicU32::from_ptr(field.cast()))
         }
+    }
+}
+
+/// Forgets a checkpoint that failed. The WAL still has its pages.
+fn end_failed_checkpoint(state: &mut SqmicroFileState) {
+    state.failed_checkpoint = None;
+    if state.store.has_pending_writes() {
+        state.store.discard_staged();
     }
 }
 
@@ -551,9 +564,8 @@ unsafe extern "C" fn vfs_open(
             store,
             compact_lock,
             shared_lock_count: 0,
-            lock_level: ffi::SQLITE_LOCK_NONE,
             wal_index: std::ptr::null_mut(),
-            backfill_to_restore: None,
+            failed_checkpoint: None,
         });
 
         let slot = p_file.cast::<SqmicroFileSlot>();
@@ -765,6 +777,9 @@ unsafe extern "C" fn io_truncate(
             return ffi::SQLITE_IOERR_TRUNCATE;
         }
         let state = state_mut(p_file);
+        if let Some(failed) = state.failed_checkpoint.take() {
+            return failed.rc;
+        }
         match state.store.truncate(size as u64, state.compact_lock.as_ref()) {
             Ok(()) => ffi::SQLITE_OK,
             Err(e) => err_to_sqlite(e, ffi::SQLITE_IOERR_TRUNCATE),
@@ -821,8 +836,9 @@ unsafe extern "C" fn io_lock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c
         let state = state_mut(p_file);
         let os_p = state.os_file_ptr();
         let rc = ((*(*os_p).pMethods).xLock.unwrap())(os_p, e_lock);
-        if rc == ffi::SQLITE_OK {
-            state.lock_level = e_lock;
+        // A WAL connection in exclusive locking mode takes no more read marks.
+        if rc == ffi::SQLITE_OK && e_lock == ffi::SQLITE_LOCK_EXCLUSIVE {
+            state.store.mark_stale();
         }
         if rc == ffi::SQLITE_OK
             && e_lock == ffi::SQLITE_LOCK_SHARED
@@ -849,25 +865,12 @@ unsafe extern "C" fn io_lock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c
 unsafe extern "C" fn io_unlock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
-        let mut flush_rc = ffi::SQLITE_OK;
-        if e_lock <= ffi::SQLITE_LOCK_SHARED && state.store.has_pending_writes() {
-            // Commits flush in FCNTL_SYNC, so this is only for pages left by a failed transaction,
-            // which its hot journal will restore.
-            if state.lock_level == ffi::SQLITE_LOCK_EXCLUSIVE
-                && let Err(e) = state.store.flush(false)
-            {
-                flush_rc = err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
-            }
-            if state.store.has_pending_writes() {
-                state.store.discard_staged();
-            }
+        // Commits flush in FCNTL_SYNC, so these are left by a failed transaction or checkpoint.
+        if state.store.has_pending_writes() {
+            state.store.discard_staged();
         }
         let os_p = state.os_file_ptr();
-        let rc = ((*(*os_p).pMethods).xUnlock.unwrap())(os_p, e_lock);
-        if rc == ffi::SQLITE_OK {
-            state.lock_level = e_lock;
-        }
-        if flush_rc != ffi::SQLITE_OK { flush_rc } else { rc }
+        ((*(*os_p).pMethods).xUnlock.unwrap())(os_p, e_lock)
     }));
     res.unwrap_or(ffi::SQLITE_INTERNAL)
 }
@@ -906,14 +909,24 @@ unsafe extern "C" fn io_file_control(
                 }
                 ffi::SQLITE_OK
             }
-            ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_CKPT_START => {
+                // The last checkpoint never released its lock if the locking mode is exclusive.
+                end_failed_checkpoint(state);
+                ffi::SQLITE_OK
+            }
             ffi::SQLITE_FCNTL_CKPT_DONE => {
                 if let Err(e) = state.store.flush(false) {
-                    // SQLite ignores this result. If the checkpoint is partial it now also counts
-                    // the frames as backfilled, so that has to be undone (see io_shm_lock).
-                    state.backfill_to_restore =
-                        state.wal_backfill().map(|b| b.load(Ordering::Acquire));
-                    return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+                    // SQLite ignores this result. If the checkpoint is complete, it truncates next,
+                    // which then reports the failure instead of retrying: after a failed sync, the
+                    // data may never reach the disk unless it is written again. If the checkpoint is
+                    // partial, SQLite counts the frames as backfilled, which has to be undone (see
+                    // io_shm_lock).
+                    let rc = err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+                    state.failed_checkpoint = Some(FailedCheckpoint {
+                        rc,
+                        backfill: state.wal_backfill().map(|b| b.load(Ordering::Acquire)),
+                    });
+                    return rc;
                 }
                 ffi::SQLITE_OK
             }
@@ -1020,14 +1033,14 @@ unsafe extern "C" fn io_shm_lock(
             let releases = |slot: c_int| (offset..offset + n).contains(&slot);
             // SQLite has just counted frames as backfilled that a failed flush left unwritten.
             if releases(WAL_READ_LOCK_0)
-                && let Some(backfill) = state.backfill_to_restore.take()
-                && state.store.has_pending_writes()
+                && let Some(failed) = &state.failed_checkpoint
+                && let Some(backfill) = failed.backfill
                 && let Some(field) = state.wal_backfill()
             {
                 field.store(backfill, Ordering::Release);
             }
-            if releases(WAL_CKPT_LOCK) && state.store.has_pending_writes() {
-                state.store.discard_staged();
+            if releases(WAL_CKPT_LOCK) {
+                end_failed_checkpoint(state);
             }
         }
 

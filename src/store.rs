@@ -125,6 +125,8 @@ pub struct PageStore<B: BlockIo> {
     has_unflushed_spills: bool,
     /// Consecutive superblock writes that failed, and so may or may not have reached the file.
     failed_publishes: u64,
+    /// The current superblock was read from the file, so it may not be durable yet.
+    base_unsynced: bool,
 
     /// The superblock must be checked before the next read.
     stale: bool,
@@ -144,6 +146,7 @@ impl<B: BlockIo> PageStore<B> {
             io,
             config,
             read_only,
+            base_unsynced: superblock.is_some(),
             superblock,
             l1,
             l2_cache: LruCache::new(L2_CACHE_MAX_BYTES),
@@ -187,6 +190,7 @@ impl<B: BlockIo> PageStore<B> {
         // Spilled chunks may be cached under offsets that the next writer will use.
         self.chunk_cache.clear();
         self.reset_staged();
+        self.base_unsynced = true;
         self.stale = true;
     }
 
@@ -245,6 +249,7 @@ impl<B: BlockIo> PageStore<B> {
 
         self.l1 = new_l1;
         self.superblock = Some(new_sb);
+        self.base_unsynced = true;
         self.reset_staged();
         self.stale = false;
         Ok(())
@@ -360,22 +365,20 @@ impl<B: BlockIo> PageStore<B> {
 
         // A page smaller than the store's is merged into the store page that contains it.
         let merged;
-        let (offset, data) = if data.len() < ps
-            && data.len().is_power_of_two()
-            && offset % data.len() as u64 == 0
-        {
-            let at = (offset % ps as u64) as usize;
-            let pgno = 1 + offset / ps as u64;
-            let mut page = vec![0u8; ps];
-            if pgno <= self.staged_page_count {
-                self.read_page_slice(pgno, 0, &mut page)?;
-            }
-            page[at..at + data.len()].copy_from_slice(data);
-            merged = page;
-            (offset - at as u64, merged.as_slice())
-        } else {
-            (offset, data)
-        };
+        let (offset, data) =
+            if data.len() < ps && data.len().is_power_of_two() && offset % data.len() as u64 == 0 {
+                let at = (offset % ps as u64) as usize;
+                let pgno = 1 + offset / ps as u64;
+                let mut page = vec![0u8; ps];
+                if pgno <= self.staged_page_count {
+                    self.read_page_slice(pgno, 0, &mut page)?;
+                }
+                page[at..at + data.len()].copy_from_slice(data);
+                merged = page;
+                (offset - at as u64, merged.as_slice())
+            } else {
+                (offset, data)
+            };
         if offset % ps as u64 != 0 || data.len() % ps != 0 {
             return Err(Error::Corrupt(format!(
                 "unaligned write: offset={offset}, len={}, page_size={ps}",
@@ -539,6 +542,17 @@ impl<B: BlockIo> PageStore<B> {
         Ok(())
     }
 
+    /// Must run before anything is written past the tail of a superblock that was read from the file.
+    /// If that superblock ends a compaction that was cut short, its tail is lower than that of the
+    /// superblock a crash would fall back to, whose data is then still needed.
+    fn sync_base(&mut self) -> Result<()> {
+        if self.base_unsynced {
+            self.io.sync()?;
+            self.base_unsynced = false;
+        }
+        Ok(())
+    }
+
     pub fn has_pending_writes(&self) -> bool {
         !self.pending_writes.is_empty() || self.has_unflushed_spills
     }
@@ -625,6 +639,7 @@ impl<B: BlockIo> PageStore<B> {
                     >= physical_data.saturating_mul(self.config.compact_threshold as u64));
 
         // Logical truncate (safe with concurrent readers; no live bytes overwritten).
+        self.sync_base()?;
         let mut new_l1 = self.l1[..new_l1_entries.min(self.l1.len())].to_vec();
         new_l1.resize(new_l1_entries, 0);
         let mut tail = self.staged_tail_offset;
@@ -826,12 +841,13 @@ impl<B: BlockIo> PageStore<B> {
         // On a brand-new 0-byte DB, publish a valid empty superblock before writing chunks at
         // 0x2000 so concurrent readers never observe file_len > 0 with an all-zero superblock.
         if self.superblock.is_none() {
-            let mut init_sb = Superblock::empty();
-            init_sb.generation = 1;
+            let init_sb = Superblock::initial();
             self.io.write_at(init_sb.slot_offset(), &init_sb.encode())?;
             self.io.sync()?;
             self.superblock = Some(init_sb);
+            self.base_unsynced = false;
         }
+        self.sync_base()?;
 
         let page_size = self.staged_page_size;
         let max_pages = self.chunk_pages_limit(page_size);
@@ -1033,8 +1049,8 @@ fn group_chunks<'a>(
     chunks
 }
 
-/// Returns `None` for an empty database: an empty file, or one that only got as far as zeros when
-/// a crash interrupted its first superblock write.
+/// Returns `None` for an empty database: an empty file, or one whose first superblock write was cut
+/// short by a crash.
 fn read_superblock<B: BlockIo>(io: &mut B, held_generation: u64) -> Result<Option<Superblock>> {
     let mut region = [0u8; SUPERBLOCK_REGION as usize];
     let mut retries = 4;
@@ -1057,8 +1073,15 @@ fn read_superblock<B: BlockIo>(io: &mut B, held_generation: u64) -> Result<Optio
         if found.is_some() {
             return Ok(found);
         }
-        if region.iter().all(|&b| b == 0) && io.file_size()? <= SUPERBLOCK_REGION {
-            return Ok(None);
+        if Superblock::is_unfinished_initial(&region) {
+            if io.file_size()? <= SUPERBLOCK_REGION {
+                return Ok(None);
+            }
+            // Another process may have created the database since the read.
+            if retries > 0 {
+                retries -= 1;
+                continue;
+            }
         }
         return Err(match Superblock::unsupported_version(&region) {
             Some(version) => Error::UnsupportedVersion(version),
@@ -1449,7 +1472,7 @@ mod tests {
         }
 
         let inner = MemBlockIo::shared();
-        let fail_sync = Rc::new(RefCell::new(true));
+        let fail_sync = Rc::new(RefCell::new(false));
         let io = FaultyIo {
             inner: inner.clone(),
             fail_sync: fail_sync.clone(),
@@ -1459,13 +1482,16 @@ mod tests {
         let mut p1 = vec![0u8; page_size];
         p1[..16].copy_from_slice(b"SQLite format 3\0");
         p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        writer.write(0, &p1).unwrap();
+        writer.flush(true).unwrap();
         p1[24..28].copy_from_slice(&99u32.to_be_bytes());
         writer.write(0, &p1).unwrap();
         writer
             .write(page_size as u64, &vec![0x77u8; page_size])
             .unwrap();
 
-        // First flush fails on sync.
+        // This flush fails on sync, with everything but the superblock written.
+        *fail_sync.borrow_mut() = true;
         assert!(writer.flush(true).is_err());
         // Clear fault and retry: all dirty L2 pages and header must still publish cleanly!
         *fail_sync.borrow_mut() = false;
@@ -1482,54 +1508,51 @@ mod tests {
     }
 
     #[test]
-    fn live_compaction_skips_when_uncompressed_size_exceeds_ram_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("huge_compressible.db");
-        let writer_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let mut writer =
-            PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
-        let lock = crate::lock::CompactLock::open(&path).unwrap();
+    fn live_compaction_only_rewrites_small_databases() {
+        // 16 KiB pages that remain after the truncation (compressible and not), and that it drops.
+        for (compressible, random, dropped, want) in [
+            (1000u64, 200u64, 320u64, false), // more than 16 MiB uncompressed
+            (800, 200, 320, true),
+            (0, 270, 320, false), // more than 4 MiB compressed
+            (0, 240, 320, true),
+            (0, 200, 240, false), // less than 4 MiB dead
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.db");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let mut writer = PageStore::open(FileBlockIo(file), Config::default(), false).unwrap();
+            let lock = crate::lock::CompactLock::open(&path).unwrap();
 
-        // Write 4200 highly compressible pages (~67 MiB uncompressed, <1 MiB compressed)
-        // plus 320 incompressible pages (~5.2 MiB) at the end, then truncate off the 320 incompressible pages.
-        // Remaining live pages: 4200 * 16 KiB = 67.2 MiB > 64 MiB uncompressed RAM cap -> must NOT live-compact!
-        let page_size = 16384usize;
-        let mut p1 = vec![0u8; page_size];
-        p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
-        writer.write(0, &p1).unwrap();
-        let zeros = vec![0x11u8; page_size];
-        for pgno in 2..=4200u64 {
-            writer.write((pgno - 1) * page_size as u64, &zeros).unwrap();
+            let ps = 16384usize;
+            let kept = compressible + random;
+            let mut x = 0x1122_3344_5566_7788u64;
+            for pgno in 1..=kept + dropped {
+                let mut buf = vec![0x11u8; ps];
+                if pgno > compressible {
+                    for word in buf.chunks_exact_mut(8) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        word.copy_from_slice(&x.to_le_bytes());
+                    }
+                }
+                buf[16..18].copy_from_slice(&(ps as u16).to_be_bytes());
+                writer.write((pgno - 1) * ps as u64, &buf).unwrap();
+            }
+            writer.flush(true).unwrap();
+            let before = writer.superblock().unwrap().compact_id;
+            writer.truncate(kept * ps as u64, Some(&lock)).unwrap();
+            let compacted = writer.superblock().unwrap().compact_id != before;
+            assert_eq!(
+                compacted, want,
+                "{compressible} + {random} pages, {dropped} dropped"
+            );
         }
-        let mut x = 0x1122_3344_5566_7788u64;
-        for pgno in 4201..=4520u64 {
-            let buf: Vec<u8> = (0..page_size)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x as u8
-                })
-                .collect();
-            writer.write((pgno - 1) * page_size as u64, &buf).unwrap();
-        }
-        writer.flush(true).unwrap();
-        let compact_id_before = writer.superblock().unwrap().compact_id;
-
-        writer
-            .truncate(4200 * page_size as u64, Some(&lock))
-            .unwrap();
-        assert_eq!(
-            writer.superblock().unwrap().compact_id,
-            compact_id_before,
-            "live compaction must skip when live uncompressed bytes exceed 64 MiB"
-        );
     }
 
     /// Keeps the operations since the last sync, to build the files a power loss could leave.
@@ -1547,7 +1570,9 @@ mod tests {
         /// Fail the write at this offset once the file has it (`true`) or before (`false`).
         fail_write: Option<(u64, bool)>,
         fail_sync: bool,
-        fail_truncate: bool,
+        /// Fail the operation that comes after this many others, once the file has it (`true`) or
+        /// before (`false`). Syncs that fail have no effect.
+        fail_op: Option<(u32, bool)>,
     }
 
     #[derive(Clone)]
@@ -1576,6 +1601,27 @@ mod tests {
     }
 
     impl CrashState {
+        /// Whether the next operation should fail, and if so whether it should still take effect.
+        fn next_op_fails(&mut self) -> Option<bool> {
+            let (left, takes_effect) = self.fail_op.take()?;
+            if left == 0 {
+                return Some(takes_effect);
+            }
+            self.fail_op = Some((left - 1, takes_effect));
+            None
+        }
+
+        /// What a power loss leaves if every unsynced write but those to the superblocks got to disk.
+        fn crash_without_superblocks(&self) -> Vec<u8> {
+            let mut file = self.durable.clone();
+            for op in &self.unsynced {
+                if !matches!(op, Op::Write(off, _) if *off < SUPERBLOCK_REGION) {
+                    op.apply(&mut file);
+                }
+            }
+            file
+        }
+
         fn push(&mut self, op: Op) {
             op.apply(&mut self.current);
             self.unsynced.push(op);
@@ -1606,6 +1652,7 @@ mod tests {
     impl BlockIo for CrashIo {
         fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
             let s = self.0.borrow();
+            assert!(buf.len() <= 1 << 24, "read of {} bytes", buf.len());
             let off = (offset as usize).min(s.current.len());
             let n = (s.current.len() - off).min(buf.len());
             buf[..n].copy_from_slice(&s.current[off..off + n]);
@@ -1613,8 +1660,11 @@ mod tests {
         }
         fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
             let mut s = self.0.borrow_mut();
-            let fail = s.fail_write.filter(|(off, _)| *off == offset);
-            if fail.is_none_or(|(_, written)| written) {
+            let fail = match s.fail_write.filter(|(off, _)| *off == offset) {
+                Some((_, written)) => Some(written),
+                None => s.next_op_fails(),
+            };
+            if fail.is_none_or(|written| written) {
                 s.push(Op::Write(offset, buf.to_vec()));
             }
             match fail {
@@ -1624,7 +1674,7 @@ mod tests {
         }
         fn sync(&mut self) -> Result<()> {
             let mut s = self.0.borrow_mut();
-            if s.fail_sync {
+            if s.fail_sync || s.next_op_fails().is_some() {
                 return Err(injected());
             }
             s.durable = s.current.clone();
@@ -1636,17 +1686,21 @@ mod tests {
         }
         fn truncate(&mut self, size: u64) -> Result<()> {
             let mut s = self.0.borrow_mut();
-            if s.fail_truncate {
-                return Err(injected());
+            let fail = s.next_op_fails();
+            if fail.is_none_or(|done| done) {
+                s.push(Op::Truncate(size));
             }
-            s.push(Op::Truncate(size));
-            Ok(())
+            match fail {
+                Some(_) => Err(injected()),
+                None => Ok(()),
+            }
         }
     }
 
     impl CrashIo {
         fn from_file(file: Vec<u8>) -> Self {
             let io = Self::default();
+            io.0.borrow_mut().durable = file.clone();
             io.0.borrow_mut().current = file;
             io
         }
@@ -1797,36 +1851,85 @@ mod tests {
             }
             io.0.borrow().current.clone()
         };
-        let want: Vec<u64> = (1..=40).map(|pgno| 20_000 + pgno).collect();
-        let run = |inject: &dyn Fn(&CrashIo, &PageStore<CrashIo>)| {
-            let io = CrashIo::from_file(base.clone());
-            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
-            let mut reader = PageStore::open(io.clone(), Config::default(), true).unwrap();
-            contents(&mut reader).unwrap();
-            inject(&io, &store);
-            let _ = store.truncate(40 * PS as u64, Some(&lock));
-            {
-                let mut s = io.0.borrow_mut();
-                (s.fail_write, s.fail_sync, s.fail_truncate) = (None, false, false);
+        let all: Vec<u64> = (1..=600).map(|pgno| 20_000 + pgno).collect();
+        let want = &all[..40];
+        for takes_effect in [false, true] {
+            let mut op = 0;
+            loop {
+                let start = || {
+                    let io = CrashIo::from_file(base.clone());
+                    let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+                    contents(&mut store).unwrap();
+                    // Another connection, that will write next.
+                    let mut reader = PageStore::open(io.clone(), Config::default(), false).unwrap();
+                    contents(&mut reader).unwrap();
+                    reader.sync_base().unwrap();
+                    io.0.borrow_mut().fail_op = Some((op, takes_effect));
+                    let _ = store.truncate(40 * PS as u64, Some(&lock));
+                    let failed = io.0.borrow_mut().fail_op.take().is_none();
+                    (io, store, reader, failed)
+                };
+
+                // The same connection carries on, after releasing its locks.
+                let (io, mut store, mut reader, failed) = start();
+                store.discard_staged();
+                store.refresh().unwrap();
+                store.truncate(40 * PS as u64, Some(&lock)).unwrap();
+                put(&mut store, 41, 555);
+                store.flush(true).unwrap();
+                let mut more = want.to_vec();
+                more.push(555);
+                assert_eq!(contents(&mut store).unwrap(), more);
+                reader.refresh().unwrap();
+                assert_eq!(contents(&mut reader).unwrap(), more);
+                assert_eq!(reopened(&io.0.borrow().current), more);
+
+                // Power is lost while it, or another process, is writing more than was reclaimed.
+                for next in 0..3 {
+                    let (io, mut store, other, _) = start();
+                    match next {
+                        0 => store.discard_staged(),
+                        1 => store = PageStore::open(io.clone(), Config::default(), false).unwrap(),
+                        _ => store = other,
+                    }
+                    for pgno in 1..=1400 {
+                        put(&mut store, pgno, 50_000 + pgno);
+                    }
+                    store.spill_pending_chunks().unwrap();
+                    let got = reopened(&io.0.borrow().crash_without_superblocks());
+                    assert!(got == all || got == want, "op {op}: {} pages", got.len());
+                }
+
+                if !failed {
+                    break;
+                }
+                op += 1;
             }
-            // The next writer, whoever it is, builds on whatever was published.
-            store.discard_staged();
-            store.refresh().unwrap();
-            store.truncate(40 * PS as u64, Some(&lock)).unwrap();
-            put(&mut store, 41, 555);
+            assert!(op >= 15, "only {op} operations");
+        }
+    }
+
+    #[test]
+    fn crash_during_creation_leaves_an_openable_file() {
+        for fail_first_sync in [false, true] {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            io.0.borrow_mut().record = true;
+            if fail_first_sync {
+                put(&mut store, 1, 1);
+                io.0.borrow_mut().fail_sync = true;
+                assert!(store.flush(true).is_err());
+                io.0.borrow_mut().fail_sync = false;
+                store.discard_staged();
+            }
+            for pgno in 1..=40 {
+                put(&mut store, pgno, pgno);
+            }
             store.flush(true).unwrap();
-            let mut want = want.clone();
-            want.push(555);
-            assert_eq!(contents(&mut store).unwrap(), want);
-            reader.refresh().unwrap();
-            assert_eq!(contents(&mut reader).unwrap(), want);
-            assert_eq!(reopened(&io.0.borrow().current), want);
-        };
-        run(&|io, _| io.0.borrow_mut().fail_truncate = true);
-        run(&|io, _| io.0.borrow_mut().fail_sync = true);
-        for slot in [0, 4096, SUPERBLOCK_REGION] {
-            for written in [false, true] {
-                run(&|io, _| io.0.borrow_mut().fail_write = Some((slot, written)));
+            let want = contents(&mut store).unwrap();
+            for file in &io.0.borrow().crashes {
+                let got = reopened(file);
+                assert!(got.is_empty() || got == want);
             }
         }
     }
@@ -1923,6 +2026,7 @@ mod tests {
         assert!(a.flush(true).is_err());
         io.0.borrow_mut().fail_sync = false;
         a.discard_staged();
+        assert!(a.is_stale());
 
         for pgno in 1..=200 {
             put(&mut b, pgno, 90_000 + pgno);
@@ -1983,8 +2087,8 @@ mod tests {
 
     #[test]
     fn superblock_caught_mid_write_is_read_again() {
-        /// Shows a half-written newer slot for the first few reads.
-        struct TearingIo(CrashIo, u32);
+        /// Damages the newer slot in the first few reads, with `.2`.
+        struct TearingIo(CrashIo, u32, fn(&mut [u8]));
         impl BlockIo for TearingIo {
             fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
                 let n = self.0.read_at(offset, buf)?;
@@ -1992,7 +2096,7 @@ mod tests {
                     self.1 -= 1;
                     let region: &[u8] = buf;
                     let newest = Superblock::select_latest(region.try_into().unwrap()).unwrap();
-                    buf[newest.slot_offset() as usize + 4090] ^= 0xff;
+                    (self.2)(&mut buf[newest.slot_offset() as usize..][..4096]);
                 }
                 Ok(n)
             }
@@ -2015,28 +2119,103 @@ mod tests {
             put(&mut store, 1, tag);
             store.flush(true).unwrap();
         }
-        let mut reader = PageStore::open(TearingIo(io.clone(), 2), Config::default(), true).unwrap();
+        let half_written: fn(&mut [u8]) = |slot| slot[4090] ^= 0xff;
+        let mut reader = PageStore::open(
+            TearingIo(io.clone(), 2, half_written),
+            Config::default(),
+            true,
+        )
+        .unwrap();
         assert_eq!(contents(&mut reader).unwrap(), [2]);
         // A slot that stays torn is what a crash leaves: the other one counts.
-        let mut reader = PageStore::open(TearingIo(io, 1000), Config::default(), true).unwrap();
+        let mut reader = PageStore::open(
+            TearingIo(io.clone(), 1000, half_written),
+            Config::default(),
+            true,
+        )
+        .unwrap();
         assert_eq!(contents(&mut reader).unwrap(), [1]);
+        // It doesn't look torn if the write hasn't reached its start, but the generation goes back.
+        let mut reader = PageStore::open(
+            TearingIo(io, 0, |slot| slot.fill(0)),
+            Config::default(),
+            true,
+        )
+        .unwrap();
+        reader.io_mut().1 = 2;
+        reader.refresh().unwrap();
+        assert_eq!(contents(&mut reader).unwrap(), [2]);
     }
 
     #[test]
     fn only_an_empty_or_zeroed_header_counts_as_a_new_database() {
         for len in [0usize, 100, 4096, 8192] {
             let mut store =
-                PageStore::open(CrashIo::from_file(vec![0; len]), Config::default(), false).unwrap();
+                PageStore::open(CrashIo::from_file(vec![0; len]), Config::default(), false)
+                    .unwrap();
             assert_eq!(store.logical_size().unwrap(), 0);
             put(&mut store, 1, 5);
             store.flush(true).unwrap();
             assert_eq!(contents(&mut store).unwrap(), [5]);
         }
-        // Zeros over a file with content are damage.
-        assert!(matches!(
-            PageStore::open(CrashIo::from_file(vec![0; 8208]), Config::default(), false),
-            Err(Error::NotASqmicroDb)
-        ));
+        // A crash can leave any sectors of the first superblock.
+        let initial = Superblock::initial().encode();
+        for sectors in 0u8..=255 {
+            let mut file = vec![0u8; 8192];
+            for i in (0..8).filter(|i| sectors & (1 << i) != 0) {
+                file[4096 + i * 512..][..512].copy_from_slice(&initial[i * 512..][..512]);
+            }
+            let mut store =
+                PageStore::open(CrashIo::from_file(file), Config::default(), false).unwrap();
+            put(&mut store, 1, 5);
+            store.flush(true).unwrap();
+            assert_eq!(contents(&mut store).unwrap(), [5]);
+        }
+        // Zeros over a file with content are damage, and other files aren't ours.
+        let mut torn = vec![0u8; 8208];
+        torn[4096..4608].copy_from_slice(&initial[..512]);
+        let mut text = vec![0u8; 8192];
+        text[4100] = b'x';
+        let mut text_first = vec![0u8; 8192];
+        text_first[0] = b'S';
+        for file in [vec![0; 8208], torn, text, text_first] {
+            assert!(matches!(
+                PageStore::open(CrashIo::from_file(file), Config::default(), false),
+                Err(Error::NotASqmicroDb)
+            ));
+        }
+    }
+
+    #[test]
+    fn database_created_while_it_is_being_opened_is_recognized() {
+        /// Lets another process create the database right before the first size query.
+        struct RacingIo(CrashIo, bool);
+        impl BlockIo for RacingIo {
+            fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                self.0.read_at(offset, buf)
+            }
+            fn write_at(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn sync(&mut self) -> Result<()> {
+                unreachable!()
+            }
+            fn file_size(&mut self) -> Result<u64> {
+                if std::mem::take(&mut self.1) {
+                    let mut writer =
+                        PageStore::open(self.0.clone(), Config::default(), false).unwrap();
+                    put(&mut writer, 1, 5);
+                    writer.flush(true).unwrap();
+                }
+                self.0.file_size()
+            }
+            fn truncate(&mut self, _: u64) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let io = RacingIo(CrashIo::default(), true);
+        let mut reader = PageStore::open(io, Config::default(), true).unwrap();
+        assert_eq!(contents(&mut reader).unwrap(), [5]);
     }
 
     #[test]
@@ -2049,7 +2228,8 @@ mod tests {
         good.l1_offset = SUPERBLOCK_REGION;
         good.tail_offset = SUPERBLOCK_REGION + 16;
         assert!(Superblock::decode(&good.encode()).is_some());
-        let bad: [fn(&mut Superblock); 8] = [
+        let bad: [fn(&mut Superblock); 9] = [
+            |sb| sb.tail_offset = SUPERBLOCK_REGION, // before the end of L1
             |sb| sb.l1_entries = u32::MAX,
             |sb| sb.page_count = 1 << 40,
             |sb| sb.page_count = u64::MAX,

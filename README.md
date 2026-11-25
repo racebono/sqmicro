@@ -204,7 +204,7 @@ Files start with the bytes `SQMICRO1`, followed by a format version. This releas
 
 - **Damage isn't always detected.** Superblocks and compressed data have checksums; the page directory, chunk headers and uncompressed chunks don't. A damaged directory can make pages read as zeros or as other pages.
 - **Windows is the main target.** Unix code paths exist but are experimental, and never compact automatically.
-- **I/O errors during a checkpoint.** SQLite ignores the result of a checkpoint's final flush. If that fails while a reader keeps the checkpoint from completing, sqmicro corrects SQLite's WAL index so that the data is still read from the WAL. A reader that starts in the instant before that can see old data in that one transaction.
+- **I/O errors during a checkpoint.** SQLite ignores the result of a checkpoint's final flush. If that fails while a reader keeps the checkpoint from completing, sqmicro corrects SQLite's WAL index so that the data is still read from the WAL. A connection that starts a transaction in the instant before that can read old data until the next commit, and if it writes, base its changes on it.
 - **`synchronous=OFF` still syncs** whenever a superblock is written. `exclusive=1` in the URI isn't supported on Windows.
 - **Rust library only.** There is no loadable extension, so tools such as the `sqlite3` shell can't open the files. [Convert](#converting-databases) them first.
 - **No memory mapping.** `PRAGMA mmap_size` has no effect.
