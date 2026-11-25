@@ -874,31 +874,16 @@ impl<B: BlockIo> PageStore<B> {
         let mut staged_entries: Vec<(u64, DirEntry)> = Vec::new();
 
         for chunk in encoded_chunks {
-            let page_count = u8::try_from(chunk.pagenos.len())
-                .map_err(|_| Error::Corrupt("chunk page_count overflow".into()))?;
-            let payload_len = u32::try_from(chunk.payload.len())
-                .map_err(|_| Error::Corrupt("chunk payload_len overflow".into()))?;
-            let total_unaligned = CHUNK_HEADER_SIZE + chunk.payload.len();
-            let aligned_len = align16(total_unaligned as u64);
-
-            let (chunk_off, new_tail) = alloc_offset(next_tail, aligned_len)?;
-            let hdr = ChunkHeader {
-                codec: chunk.codec,
-                page_count,
-                dict_id: 0,
-                payload_len,
-            };
-
-            let mut disk_buf = vec![0u8; aligned_len as usize];
-            disk_buf[..CHUNK_HEADER_SIZE].copy_from_slice(&hdr.encode());
-            disk_buf[CHUNK_HEADER_SIZE..total_unaligned].copy_from_slice(&chunk.payload);
-            self.io.write_at(chunk_off, &disk_buf)?;
+            let block_len = chunk.block.len() as u64;
+            let (chunk_off, new_tail) = alloc_offset(next_tail, block_len)?;
+            self.io.write_at(chunk_off, &chunk.block)?;
 
             next_tail = new_tail;
-            added_live_bytes = added_live_bytes.saturating_add(aligned_len);
+            added_live_bytes = added_live_bytes.saturating_add(block_len);
 
+            let read_len = chunk.read_len();
             for (slot_idx, pgno) in chunk.pagenos.into_iter().enumerate() {
-                let entry = DirEntry::new(chunk_off, total_unaligned, slot_idx as u8)?;
+                let entry = DirEntry::new(chunk_off, read_len, slot_idx as u8)?;
                 staged_entries.push((pgno, entry));
             }
         }

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::error::{Error, Result};
-use crate::format::ChunkCodec;
+use crate::format::{CHUNK_HEADER_SIZE, ChunkCodec, ChunkHeader, align16};
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
@@ -58,38 +58,53 @@ impl Compressor {
         Ok(this)
     }
 
+    /// Compresses a block started with `new_block`, keeping room for the chunk header in the
+    /// result. Returns `raw` itself when compression is skipped or doesn't help.
     pub fn compress(&mut self, raw: Vec<u8>, force_raw: bool) -> Result<(ChunkCodec, Vec<u8>)> {
-        if force_raw || raw.is_empty() {
+        let src = &raw[CHUNK_HEADER_SIZE..];
+        if force_raw || src.is_empty() {
             return Ok((ChunkCodec::Raw, raw));
         }
-        let bound = unsafe { zstd_sys::ZSTD_compressBound(raw.len()) };
+        let bound = unsafe { zstd_sys::ZSTD_compressBound(src.len()) };
 
-        let mut out = Box::<[u8]>::new_uninit_slice(bound);
+        let mut out = new_block(bound);
+        let dst = &mut out.spare_capacity_mut()[..bound];
+
         let written = unsafe {
             zstd_sys::ZSTD_compress2(
                 self.cctx.as_ptr(),
-                out.as_mut_ptr().cast::<c_void>(),
-                out.len(),
-                raw.as_ptr().cast::<c_void>(),
-                raw.len(),
+                dst.as_mut_ptr().cast::<c_void>(),
+                dst.len(),
+                src.as_ptr().cast::<c_void>(),
+                src.len(),
             )
         };
 
         if unsafe { zstd_sys::ZSTD_isError(written) } != 0 {
             return Err(Error::Zstd(zstd_err(written)));
         }
+        // SAFETY: zstd initialized the `written` bytes after the header, and `written <= bound`.
+        unsafe { out.set_len(out.len() + written) };
 
-        let out = unsafe {
-            let ptr = Box::into_raw(out);
-            Vec::<u8>::from_raw_parts(ptr.cast(), written, ptr.len())
-        };
-
-        if out.len() >= raw.len() {
+        if written >= src.len() {
             return Ok((ChunkCodec::Raw, raw));
         }
 
         Ok((ChunkCodec::Zstd, out))
     }
+}
+
+/// An empty chunk block: a placeholder header, plus capacity for `payload_len` bytes and up to
+/// 15 bytes of padding.
+#[inline]
+fn new_block(payload_len: usize) -> Vec<u8> {
+    let mut out = Box::<[u8]>::new_uninit_slice(CHUNK_HEADER_SIZE + payload_len + 15);
+    // SAFETY: `out` holds at least `CHUNK_HEADER_SIZE` bytes.
+    unsafe { std::ptr::write_bytes(out.as_mut_ptr().cast::<u8>(), 0, CHUNK_HEADER_SIZE) };
+    let out = Box::into_raw(out);
+    // SAFETY: the allocation has the layout of a `Vec<u8>` with capacity `out.len()`, and its
+    // first `CHUNK_HEADER_SIZE` bytes are initialized.
+    unsafe { Vec::from_raw_parts(out.cast(), CHUNK_HEADER_SIZE, out.len()) }
 }
 
 pub struct Decompressor {
@@ -174,24 +189,48 @@ pub struct ChunkInput<'a> {
 
 pub struct EncodedChunk {
     pub pagenos: Vec<u64>,
-    pub codec: ChunkCodec,
-    pub payload: Vec<u8>,
+    pub header: ChunkHeader,
+    /// Exactly what goes on disk: header, payload, then zero padding to 16 bytes.
+    pub block: Vec<u8>,
     pub raw_len: usize,
+}
+
+impl EncodedChunk {
+    /// Header and payload length, without the padding.
+    pub fn read_len(&self) -> usize {
+        CHUNK_HEADER_SIZE + self.header.payload_len as usize
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.block[CHUNK_HEADER_SIZE..self.read_len()]
+    }
 }
 
 fn encode_one(compressor: &mut Compressor, input: &ChunkInput) -> Result<EncodedChunk> {
     let raw_len: usize = input.pages.iter().map(|(_, data)| data.len()).sum();
     let mut pagenos = Vec::with_capacity(input.pages.len());
-    let mut raw = Vec::with_capacity(raw_len);
+    let mut raw = new_block(raw_len);
     for (pgno, data) in &input.pages {
         pagenos.push(*pgno);
         raw.extend_from_slice(data);
     }
-    let (codec, payload) = compressor.compress(raw, input.force_raw)?;
+
+    let (codec, mut block) = compressor.compress(raw, input.force_raw)?;
+    let header = ChunkHeader {
+        codec,
+        page_count: u8::try_from(pagenos.len())
+            .map_err(|_| Error::Corrupt("chunk page_count overflow".into()))?,
+        dict_id: 0,
+        payload_len: u32::try_from(block.len() - CHUNK_HEADER_SIZE)
+            .map_err(|_| Error::Corrupt("chunk payload_len overflow".into()))?,
+    };
+    block[..CHUNK_HEADER_SIZE].copy_from_slice(&header.encode());
+    block.resize(align16(block.len() as u64) as usize, 0);
+
     Ok(EncodedChunk {
         pagenos,
-        codec,
-        payload,
+        header,
+        block,
         raw_len,
     })
 }
@@ -249,15 +288,22 @@ pub fn compress_chunks_parallel(
 mod tests {
     use super::*;
 
+    fn block_of(raw: &[u8]) -> Vec<u8> {
+        let mut block = new_block(raw.len());
+        block.extend_from_slice(raw);
+        block
+    }
+
     #[test]
     fn compressible_chunk_uses_zstd_and_roundtrips() {
         let raw = vec![0x42u8; 16 * 1024];
         let mut c = Compressor::new(3).unwrap();
-        let (codec, payload) = c.compress(raw.clone(), false).unwrap();
+        let (codec, block) = c.compress(block_of(&raw), false).unwrap();
         assert_eq!(codec, ChunkCodec::Zstd);
+        let payload = &block[CHUNK_HEADER_SIZE..];
         assert!(payload.len() < raw.len() / 10);
         let mut d = Decompressor::new().unwrap();
-        assert_eq!(d.decompress(codec, &payload, raw.len()).unwrap(), raw);
+        assert_eq!(d.decompress(codec, payload, raw.len()).unwrap(), raw);
     }
 
     #[test]
@@ -272,27 +318,28 @@ mod tests {
             })
             .collect();
         let mut c = Compressor::new(3).unwrap();
-        let (codec, payload) = c.compress(raw.clone(), false).unwrap();
+        let (codec, block) = c.compress(block_of(&raw), false).unwrap();
         assert_eq!(codec, ChunkCodec::Raw);
-        assert_eq!(payload, raw);
+        assert_eq!(block[CHUNK_HEADER_SIZE..], raw);
 
         let zeros = vec![0u8; 4096];
-        let (codec2, payload2) = c.compress(zeros.clone(), true).unwrap();
+        let (codec2, block2) = c.compress(block_of(&zeros), true).unwrap();
         assert_eq!(codec2, ChunkCodec::Raw);
-        assert_eq!(payload2, zeros);
+        assert_eq!(block2[CHUNK_HEADER_SIZE..], zeros);
     }
 
     #[test]
     fn bitflip_in_compressed_payload_fails_checksum_with_corrupt() {
         let raw: Vec<u8> = (0..16384).map(|i| (i % 97) as u8).collect();
         let mut c = Compressor::new(3).unwrap();
-        let (codec, mut payload) = c.compress(raw.clone(), false).unwrap();
+        let (codec, mut block) = c.compress(block_of(&raw), false).unwrap();
         assert_eq!(codec, ChunkCodec::Zstd);
+        let payload = &mut block[CHUNK_HEADER_SIZE..];
         let mid = payload.len() / 2;
         payload[mid] ^= 0x01;
         let mut d = Decompressor::new().unwrap();
         assert!(matches!(
-            d.decompress(codec, &payload, raw.len()),
+            d.decompress(codec, payload, raw.len()),
             Err(Error::Corrupt(_))
         ));
     }
@@ -311,11 +358,16 @@ mod tests {
             .collect();
         let encoded = compress_chunks_parallel(inputs, 3, 4).unwrap();
         assert_eq!(encoded.len(), 8);
-        assert_eq!(encoded[0].codec, ChunkCodec::Raw);
+        assert_eq!(encoded[0].header.codec, ChunkCodec::Raw);
         let mut d = Decompressor::new().unwrap();
         for (i, ch) in encoded.iter().enumerate() {
             assert_eq!(ch.pagenos, vec![i as u64 + 1, i as u64 + 2]);
-            let decoded = d.decompress(ch.codec, &ch.payload, ch.raw_len).unwrap();
+            assert_eq!(ch.block[..CHUNK_HEADER_SIZE], ch.header.encode());
+            assert_eq!(ch.block.len() as u64, align16(ch.read_len() as u64));
+            assert!(ch.block[ch.read_len()..].iter().all(|&b| b == 0));
+            let decoded = d
+                .decompress(ch.header.codec, ch.payload(), ch.raw_len)
+                .unwrap();
             assert_eq!(&decoded[..8192], &vec![i as u8; 8192][..]);
             assert_eq!(&decoded[8192..], &vec![(i + 10) as u8; 8192][..]);
         }
