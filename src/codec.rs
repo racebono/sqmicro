@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::format::ChunkCodec;
+use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
 
@@ -105,12 +106,12 @@ impl Decompressor {
         Ok(Self { dctx })
     }
 
-    pub fn decompress(
+    pub fn decompress<'p>(
         &mut self,
         codec: ChunkCodec,
-        payload: &[u8],
+        payload: &'p [u8],
         expected_len: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Cow<'p, [u8]>> {
         match codec {
             ChunkCodec::Raw => {
                 if payload.len() != expected_len {
@@ -119,10 +120,10 @@ impl Decompressor {
                         payload.len()
                     )));
                 }
-                Ok(payload.to_vec())
+                Ok(Cow::Borrowed(payload))
             }
             ChunkCodec::Zstd => {
-                let mut out = vec![0u8; expected_len];
+                let mut out = Box::<[u8]>::new_uninit_slice(expected_len);
                 let decoded = unsafe {
                     zstd_sys::ZSTD_decompressDCtx(
                         self.dctx.as_ptr(),
@@ -132,18 +133,27 @@ impl Decompressor {
                         payload.len(),
                     )
                 };
+
                 if unsafe { zstd_sys::ZSTD_isError(decoded) } != 0 {
                     return Err(Error::Corrupt(format!(
                         "zstd decompression failed: {}",
                         zstd_err(decoded)
                     )));
                 }
-                if decoded != expected_len {
+
+                let out = unsafe {
+                    let ptr = Box::into_raw(out);
+                    Vec::<u8>::from_raw_parts(ptr.cast(), decoded, ptr.len())
+                };
+
+                if out.len() != expected_len {
                     return Err(Error::Corrupt(format!(
-                        "zstd decoded {decoded} bytes, expected {expected_len}"
+                        "zstd decoded {} bytes, expected {expected_len}",
+                        out.len()
                     )));
                 }
-                Ok(out)
+
+                Ok(Cow::Owned(out))
             }
         }
     }

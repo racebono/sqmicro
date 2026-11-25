@@ -183,10 +183,9 @@ impl<B: BlockIo> PageStore<B> {
             return Err(Error::NotASqmicroDb);
         };
 
-        let same_gen = self
-            .superblock
-            .as_ref()
-            .is_some_and(|old| old.generation == new_sb.generation && old.compact_id == new_sb.compact_id);
+        let same_gen = self.superblock.as_ref().is_some_and(|old| {
+            old.generation == new_sb.generation && old.compact_id == new_sb.compact_id
+        });
         if same_gen {
             return Ok(());
         }
@@ -1017,20 +1016,26 @@ impl<B: BlockIo> PageStore<B> {
         let expected_raw_len = (hdr.page_count as usize)
             .checked_mul(ps)
             .ok_or_else(|| Error::Corrupt("chunk raw length overflow".into()))?;
+
         let decompressed = self.decompressor.decompress(
             hdr.codec,
             &raw_disk[CHUNK_HEADER_SIZE..payload_end],
             expected_raw_len,
         )?;
+
         if end > decompressed.len() {
             return Err(Error::Corrupt(format!(
                 "page index {page_idx} out of bounds for chunk with {} pages",
                 hdr.page_count
             )));
         }
+
         dst.copy_from_slice(&decompressed[start..end]);
         let byte_len = decompressed.len();
-        self.chunk_cache.insert(chunk_off, decompressed, byte_len);
+
+        self.chunk_cache
+            .insert(chunk_off, decompressed.into_owned(), byte_len);
+
         Ok(())
     }
 }
@@ -1158,7 +1163,9 @@ mod tests {
         let mut sb = Superblock::empty();
         sb.generation = 2;
         sb.format_version = 1;
-        mem.clone().write_at(sb.slot_offset(), &sb.encode()).unwrap();
+        mem.clone()
+            .write_at(sb.slot_offset(), &sb.encode())
+            .unwrap();
         let before = mem.0.borrow().clone();
         for read_only in [true, false] {
             assert!(matches!(
@@ -1226,7 +1233,9 @@ mod tests {
         for pgno in 2..=21u64 {
             let mut out = vec![0u8; page_size];
             assert!(matches!(
-                reader.read((pgno - 1) * page_size as u64, &mut out).unwrap(),
+                reader
+                    .read((pgno - 1) * page_size as u64, &mut out)
+                    .unwrap(),
                 ReadOutcome::Full
             ));
             assert_eq!(&out[..8], &pgno.to_le_bytes());
@@ -1279,7 +1288,8 @@ mod tests {
             .truncate(true)
             .open(&path)
             .unwrap();
-        let mut writer = PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
+        let mut writer =
+            PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
         let lock = crate::lock::CompactLock::open(&path).unwrap();
 
         let page_size = 16384usize;
@@ -1303,7 +1313,8 @@ mod tests {
         assert!(big_size > 4 * 1024 * 1024);
 
         let reader_file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
-        let mut reader = PageStore::open(FileBlockIo(reader_file), Config::default(), true).unwrap();
+        let mut reader =
+            PageStore::open(FileBlockIo(reader_file), Config::default(), true).unwrap();
         let mut before = vec![0u8; page_size];
         reader.read(page_size as u64, &mut before).unwrap();
         let old_compact_id = reader.superblock().unwrap().compact_id;
@@ -1336,7 +1347,8 @@ mod tests {
             .truncate(true)
             .open(&path)
             .unwrap();
-        let mut writer = PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
+        let mut writer =
+            PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
         let w_lock = crate::lock::CompactLock::open(&path).unwrap();
         let r_lock = crate::lock::CompactLock::open(&path).unwrap();
 
@@ -1407,7 +1419,11 @@ mod tests {
             }
             fn sync(&mut self) -> Result<()> {
                 if *self.fail_sync.borrow() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected sync fault").into());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "injected sync fault",
+                    )
+                    .into());
                 }
                 Ok(())
             }
@@ -1432,7 +1448,9 @@ mod tests {
         p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
         p1[24..28].copy_from_slice(&99u32.to_be_bytes());
         writer.write(0, &p1).unwrap();
-        writer.write(page_size as u64, &vec![0x77u8; page_size]).unwrap();
+        writer
+            .write(page_size as u64, &vec![0x77u8; page_size])
+            .unwrap();
 
         // First flush fails on sync.
         assert!(writer.flush(true).is_err());
@@ -1461,7 +1479,8 @@ mod tests {
             .truncate(true)
             .open(&path)
             .unwrap();
-        let mut writer = PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
+        let mut writer =
+            PageStore::open(FileBlockIo(writer_file), Config::default(), false).unwrap();
         let lock = crate::lock::CompactLock::open(&path).unwrap();
 
         // Write 4200 highly compressible pages (~67 MiB uncompressed, <1 MiB compressed)
@@ -1490,7 +1509,9 @@ mod tests {
         writer.flush(true).unwrap();
         let compact_id_before = writer.superblock().unwrap().compact_id;
 
-        writer.truncate(4200 * page_size as u64, Some(&lock)).unwrap();
+        writer
+            .truncate(4200 * page_size as u64, Some(&lock))
+            .unwrap();
         assert_eq!(
             writer.superblock().unwrap().compact_id,
             compact_id_before,
