@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sqmicro::{VFS_NAME, register, uri};
 use std::path::PathBuf;
 use std::process::Command;
@@ -120,7 +120,7 @@ fn cross_process_child_writer_entry() {
         )
         .unwrap();
 
-    // Deterministic pseudo-random blob generator so phase 1 exceeds 4 MiB on disk to test live compaction.
+    // Deterministic pseudo-random blob generator, so part of phase 1 doesn't compress.
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
     let mut next_blob = |len: usize| -> Vec<u8> {
         (0..len)
@@ -144,7 +144,7 @@ fn cross_process_child_writer_entry() {
                     continue;
                 }
                 let lap = (t / 95.0) as i64;
-                // Attach 512B high-entropy blob to 1 in 4 rows in phase 1 so DB grows > 4 MiB compressed
+                // Attach 512B high-entropy blob to 1 in 4 rows in phase 1
                 let blob = if tick % 4 == 0 {
                     next_blob(512)
                 } else {
@@ -316,7 +316,7 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
                             [],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
-                        .ok();
+                        .optional()?;
                     if let Some((pid, _)) = player {
                         let mut stmt = conn.prepare_cached(
                             "SELECT id, vehicle_id, speed, lap_distance FROM telemetry WHERE id BETWEEN ?1 AND ?2",

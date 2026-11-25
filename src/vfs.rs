@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, Prefix};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub const VFS_NAME: &str = "sqmicro";
@@ -183,6 +184,7 @@ struct OsFileBlockIo {
     // 8-byte aligned heap storage for the wrapped OS sqlite3_file.
     raw: Box<[u64]>,
     closed: bool,
+    sync_flags: c_int,
 }
 
 impl OsFileBlockIo {
@@ -191,6 +193,7 @@ impl OsFileBlockIo {
         Self {
             raw: vec![0u64; words].into_boxed_slice(),
             closed: true,
+            sync_flags: ffi::SQLITE_SYNC_NORMAL,
         }
     }
 
@@ -289,7 +292,7 @@ impl BlockIo for OsFileBlockIo {
                     code: ffi::SQLITE_IOERR_FSYNC,
                     message: "wrapped VFS missing xSync".into(),
                 })?;
-            x_sync(p, ffi::SQLITE_SYNC_NORMAL)
+            x_sync(p, self.sync_flags)
         };
         if rc == ffi::SQLITE_OK {
             Ok(())
@@ -349,13 +352,36 @@ struct SqmicroFileState {
     store: PageStore<OsFileBlockIo>,
     compact_lock: Option<CompactLock>,
     shared_lock_count: u32,
-    read_only: bool,
+    /// Main database lock held, as `SQLITE_LOCK_*`.
+    lock_level: c_int,
+    /// First region of the WAL index, while mapped.
+    wal_index: *mut c_void,
+    /// `nBackfill` from before a checkpoint whose flush failed.
+    backfill_to_restore: Option<u32>,
 }
+
+/// Offset of `nBackfill` in the WAL index (https://sqlite.org/walformat.html).
+const WAL_INDEX_BACKFILL_OFFSET: usize = 96;
+/// Slots in the WAL index lock array.
+const WAL_CKPT_LOCK: c_int = 1;
+const WAL_READ_LOCK_0: c_int = 3;
 
 impl SqmicroFileState {
     #[inline]
     fn os_file_ptr(&mut self) -> *mut ffi::sqlite3_file {
         self.store.io_mut().as_file_ptr()
+    }
+
+    fn wal_backfill(&self) -> Option<&AtomicU32> {
+        if self.wal_index.is_null() {
+            return None;
+        }
+        // SAFETY: SQLite keeps the region mapped until xShmUnmap, which clears `wal_index`. It is
+        // at least 32 KiB, aligned, and SQLite also accesses this field atomically.
+        unsafe {
+            let field = self.wal_index.cast::<u8>().add(WAL_INDEX_BACKFILL_OFFSET);
+            Some(AtomicU32::from_ptr(field.cast()))
+        }
     }
 }
 
@@ -377,10 +403,10 @@ fn c_path_to_pathbuf(z_name: *const c_char) -> Result<std::path::PathBuf> {
 fn err_to_sqlite(err: Error, default_ioerr: c_int) -> c_int {
     match err {
         Error::Sqlite { code, .. } => code,
-        Error::Corrupt(_) | Error::Zstd(_) => ffi::SQLITE_CORRUPT,
+        Error::Corrupt(_) => ffi::SQLITE_CORRUPT,
         Error::NotASqmicroDb | Error::UnsupportedVersion(_) => ffi::SQLITE_NOTADB,
         Error::InvalidConfig(_) | Error::InvalidPath(_) => ffi::SQLITE_CANTOPEN,
-        Error::Io(_) => default_ioerr,
+        Error::Io(_) | Error::Zstd(_) => default_ioerr,
     }
 }
 
@@ -486,25 +512,24 @@ unsafe extern "C" fn vfs_open(
         }
         os_io.closed = false;
 
-        let path = match c_path_to_pathbuf(z_name) {
-            Ok(p) => p,
-            Err(e) => {
-                (*p_file).pMethods = std::ptr::null();
-                return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
+        // The lock needs a second handle to the file. On Unix, closing that would drop the locks
+        // SQLite holds on the file through every connection in this process, so there is no lock
+        // there, and without it no live compaction.
+        let mut compact_lock = None;
+        if cfg!(windows) {
+            match c_path_to_pathbuf(z_name).and_then(|path| CompactLock::open(&path)) {
+                Ok(lock) => compact_lock = Some(lock),
+                Err(e) => {
+                    (*p_file).pMethods = std::ptr::null();
+                    return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
+                }
             }
-        };
-        let compact_lock = match CompactLock::open(&path) {
-            Ok(lock) => lock,
-            Err(e) => {
-                (*p_file).pMethods = std::ptr::null();
-                return err_to_sqlite(e, ffi::SQLITE_CANTOPEN);
-            }
-        };
+        }
 
         // Hold shared CompactLock while reading initial superblock + L1 root so a concurrent
-        // live_compact_to cannot overwrite or truncate offsets beneath PageStore::open.
+        // live_compact cannot overwrite or truncate offsets beneath PageStore::open.
         let open_res = {
-            let _guard = match compact_lock.lock_shared_guard() {
+            let _guard = match compact_lock.as_ref().map(|l| l.lock_shared_guard()).transpose() {
                 Ok(g) => g,
                 Err(e) => {
                     (*p_file).pMethods = std::ptr::null();
@@ -524,9 +549,11 @@ unsafe extern "C" fn vfs_open(
 
         let state = Box::new(SqmicroFileState {
             store,
-            compact_lock: Some(compact_lock),
+            compact_lock,
             shared_lock_count: 0,
-            read_only,
+            lock_level: ffi::SQLITE_LOCK_NONE,
+            wal_index: std::ptr::null_mut(),
+            backfill_to_restore: None,
         });
 
         let slot = p_file.cast::<SqmicroFileSlot>();
@@ -643,14 +670,7 @@ unsafe extern "C" fn io_close(p_file: *mut ffi::sqlite3_file) -> c_int {
         let mut state = Box::from_raw((*slot).state);
         (*slot).state = std::ptr::null_mut();
 
-        let mut rc = ffi::SQLITE_OK;
-        if !state.read_only
-            && state.store.has_pending_writes()
-            && let Err(e) = state.store.flush(false)
-        {
-            rc = err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
-        }
-
+        // Anything still staged failed to flush while a lock protected it, and nothing does now.
         if state.shared_lock_count > 0
             && let Some(lock) = &state.compact_lock
         {
@@ -659,8 +679,7 @@ unsafe extern "C" fn io_close(p_file: *mut ffi::sqlite3_file) -> c_int {
         }
         drop(state.compact_lock.take());
 
-        let os_rc = state.store.into_io().close_os();
-        if rc == ffi::SQLITE_OK { os_rc } else { rc }
+        state.store.into_io().close_os()
     }));
     res.unwrap_or(ffi::SQLITE_INTERNAL)
 }
@@ -693,6 +712,15 @@ unsafe extern "C" fn io_read(
         } else {
             None
         };
+        // A WAL reader must not look at the superblock before SQLite has decided which frames to
+        // read from the WAL, and the first read is the earliest point after that. Without a WAL
+        // read lock, page 1 is read before SQLite knows whether there is a WAL, so a compaction may
+        // have moved it since the last check.
+        if (state.store.is_stale() || (state.shared_lock_count == 0 && i_ofst < 512))
+            && let Err(e) = state.store.refresh()
+        {
+            return err_to_sqlite(e, ffi::SQLITE_IOERR_READ);
+        }
         match state.store.read(i_ofst as u64, buf) {
             Ok(ReadOutcome::Full) => ffi::SQLITE_OK,
             Ok(ReadOutcome::ShortRead) => ffi::SQLITE_IOERR_SHORT_READ,
@@ -745,9 +773,10 @@ unsafe extern "C" fn io_truncate(
     res.unwrap_or(ffi::SQLITE_INTERNAL)
 }
 
-unsafe extern "C" fn io_sync(p_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
+unsafe extern "C" fn io_sync(p_file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
+        state.store.io_mut().sync_flags = flags;
         match state.store.flush(true) {
             Ok(()) => ffi::SQLITE_OK,
             Err(e) => err_to_sqlite(e, ffi::SQLITE_IOERR_FSYNC),
@@ -792,6 +821,9 @@ unsafe extern "C" fn io_lock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c
         let state = state_mut(p_file);
         let os_p = state.os_file_ptr();
         let rc = ((*(*os_p).pMethods).xLock.unwrap())(os_p, e_lock);
+        if rc == ffi::SQLITE_OK {
+            state.lock_level = e_lock;
+        }
         if rc == ffi::SQLITE_OK
             && e_lock == ffi::SQLITE_LOCK_SHARED
             && !state.store.has_pending_writes()
@@ -818,15 +850,23 @@ unsafe extern "C" fn io_unlock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) ->
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
         let mut flush_rc = ffi::SQLITE_OK;
-        if !state.read_only
-            && e_lock <= ffi::SQLITE_LOCK_SHARED
-            && state.store.has_pending_writes()
-            && let Err(e) = state.store.flush(false)
-        {
-            flush_rc = err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+        if e_lock <= ffi::SQLITE_LOCK_SHARED && state.store.has_pending_writes() {
+            // Commits flush in FCNTL_SYNC, so this is only for pages left by a failed transaction,
+            // which its hot journal will restore.
+            if state.lock_level == ffi::SQLITE_LOCK_EXCLUSIVE
+                && let Err(e) = state.store.flush(false)
+            {
+                flush_rc = err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+            }
+            if state.store.has_pending_writes() {
+                state.store.discard_staged();
+            }
         }
         let os_p = state.os_file_ptr();
         let rc = ((*(*os_p).pMethods).xUnlock.unwrap())(os_p, e_lock);
+        if rc == ffi::SQLITE_OK {
+            state.lock_level = e_lock;
+        }
         if flush_rc != ffi::SQLITE_OK { flush_rc } else { rc }
     }));
     res.unwrap_or(ffi::SQLITE_INTERNAL)
@@ -851,6 +891,13 @@ unsafe extern "C" fn io_file_control(
 ) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
+        // Commits always get here before the journal is finalized, unlike xSync, which
+        // `synchronous=OFF` skips.
+        if op == ffi::SQLITE_FCNTL_SYNC
+            && let Err(e) = state.store.flush(false)
+        {
+            return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+        }
         match op {
             ffi::SQLITE_FCNTL_SIZE_HINT | ffi::SQLITE_FCNTL_CHUNK_SIZE => ffi::SQLITE_OK,
             ffi::SQLITE_FCNTL_MMAP_SIZE => {
@@ -861,14 +908,14 @@ unsafe extern "C" fn io_file_control(
             }
             ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
             ffi::SQLITE_FCNTL_CKPT_DONE => {
-                if !state.read_only && state.store.has_pending_writes() {
-                    match state.store.flush(false) {
-                        Ok(()) => ffi::SQLITE_OK,
-                        Err(e) => err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE),
-                    }
-                } else {
-                    ffi::SQLITE_OK
+                if let Err(e) = state.store.flush(false) {
+                    // SQLite ignores this result. If the checkpoint is partial it now also counts
+                    // the frames as backfilled, so that has to be undone (see io_shm_lock).
+                    state.backfill_to_restore =
+                        state.wal_backfill().map(|b| b.load(Ordering::Acquire));
+                    return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
                 }
+                ffi::SQLITE_OK
             }
             ffi::SQLITE_FCNTL_LOCKSTATE
             | ffi::SQLITE_FCNTL_LAST_ERRNO
@@ -896,8 +943,15 @@ unsafe extern "C" fn io_sector_size(_p_file: *mut ffi::sqlite3_file) -> c_int {
     4096
 }
 
-unsafe extern "C" fn io_device_characteristics(_p_file: *mut ffi::sqlite3_file) -> c_int {
-    ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
+unsafe extern "C" fn io_device_characteristics(p_file: *mut ffi::sqlite3_file) -> c_int {
+    let res = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let os_p = state_mut(p_file).os_file_ptr();
+        // The only bit that still holds for a compressed file. `psow=0` in the URI turns it off.
+        (*(*os_p).pMethods)
+            .xDeviceCharacteristics
+            .map_or(0, |f| f(os_p) & ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE)
+    }));
+    res.unwrap_or(0)
 }
 
 unsafe extern "C" fn io_shm_map(
@@ -911,7 +965,11 @@ unsafe extern "C" fn io_shm_map(
         let state = state_mut(p_file);
         let os_p = state.os_file_ptr();
         if let Some(f) = (*(*os_p).pMethods).xShmMap {
-            f(os_p, i_pg, pgsz, b_extend, pp)
+            let rc = f(os_p, i_pg, pgsz, b_extend, pp);
+            if rc == ffi::SQLITE_OK && i_pg == 0 && !pp.is_null() {
+                state.wal_index = *pp;
+            }
+            rc
         } else {
             ffi::SQLITE_IOERR_SHMMAP
         }
@@ -954,24 +1012,23 @@ unsafe extern "C" fn io_shm_lock(
                 return rc;
             }
             state.shared_lock_count = state.shared_lock_count.saturating_add(1);
-            if !state.store.has_pending_writes()
-                && let Err(e) = state.store.refresh()
-            {
-                // Release locks cleanly if refresh failed.
-                let os_p = state.os_file_ptr();
-                if let Some(f) = (*(*os_p).pMethods).xShmLock {
-                    let unlock_flags = (flags & !ffi::SQLITE_SHM_LOCK) | ffi::SQLITE_SHM_UNLOCK;
-                    let _ = f(os_p, offset, n, unlock_flags);
-                }
-                state.shared_lock_count = state.shared_lock_count.saturating_sub(1);
-                if state.shared_lock_count == 0
-                    && let Some(lock) = &state.compact_lock
-                {
-                    let _ = lock.unlock();
-                }
-                return err_to_sqlite(e, ffi::SQLITE_IOERR_READ);
-            }
+            state.store.mark_stale();
             return ffi::SQLITE_OK;
+        }
+
+        if is_unlock && (flags & ffi::SQLITE_SHM_EXCLUSIVE) != 0 {
+            let releases = |slot: c_int| (offset..offset + n).contains(&slot);
+            // SQLite has just counted frames as backfilled that a failed flush left unwritten.
+            if releases(WAL_READ_LOCK_0)
+                && let Some(backfill) = state.backfill_to_restore.take()
+                && state.store.has_pending_writes()
+                && let Some(field) = state.wal_backfill()
+            {
+                field.store(backfill, Ordering::Release);
+            }
+            if releases(WAL_CKPT_LOCK) && state.store.has_pending_writes() {
+                state.store.discard_staged();
+            }
         }
 
         let os_p = state.os_file_ptr();
@@ -1007,6 +1064,7 @@ unsafe extern "C" fn io_shm_barrier(p_file: *mut ffi::sqlite3_file) {
 unsafe extern "C" fn io_shm_unmap(p_file: *mut ffi::sqlite3_file, delete_flag: c_int) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         let state = state_mut(p_file);
+        state.wal_index = std::ptr::null_mut();
         let os_p = state.os_file_ptr();
         if let Some(f) = (*(*os_p).pMethods).xShmUnmap {
             f(os_p, delete_flag)

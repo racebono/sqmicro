@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Every process that opens the file must do so through sqmicro. Plain SQLite doesn't recognise it.
 
-WAL mode with 16 KiB pages is the recommended setup. All SQLite page sizes work.
+WAL mode with 16 KiB pages is the recommended setup. All SQLite page sizes work, but set it before the first table: after a later `PRAGMA page_size` and `VACUUM`, the file keeps storing pages of the original size, which makes smaller pages slower to write.
 
 ## Configuration
 
@@ -106,15 +106,15 @@ let stats = compact(
 println!("{} -> {} bytes", stats.input_bytes, stats.output_bytes);
 ```
 
-Close every connection to the source first. `compact` returns an error if the source still has a non-empty `-wal` file, but it doesn't check whether another connection is writing. It replaces the destination if it already exists.
+Close every connection to both files first. `compact` returns an error if either has a non-empty `-wal` file or a hot `-journal` next to it, but it doesn't check whether another connection is writing. It replaces the destination if it already exists.
 
-**Automatic.** When SQLite shrinks the database, as happens after `DELETE`, `VACUUM` and a checkpoint, sqmicro compacts it in place if all of these hold:
+**Automatic (Windows only).** When SQLite shrinks the database, as happens after `DELETE`, `VACUUM` and a checkpoint, sqmicro compacts it in place if all of these hold:
 
 - no reader is in the middle of a transaction (otherwise it skips compaction instead of waiting);
-- the remaining data is at most 16 MiB compressed and 64 MiB uncompressed;
+- the remaining data is at most 4 MiB compressed and 16 MiB uncompressed;
 - at least 4 MiB, and at least `compact_threshold` percent, of the file is dead.
 
-A database that shrinks to nothing is always reset, readers permitting. In practice this covers clearing a recording between sessions. Larger databases need `compact`.
+A database that shrinks to nothing is always reset, readers permitting. In practice this covers clearing a recording between sessions. Larger databases need `compact`. Readers that start during automatic compaction wait for it to finish.
 
 ## Converting databases
 
@@ -122,8 +122,6 @@ A database that shrinks to nothing is always reset, readers permitting. In pract
 
 ```sql
 -- Plain to sqmicro, from a connection to the plain database.
--- cache_size must be larger than the database: see Limitations.
-PRAGMA cache_size = -1048576; -- 1 GiB
 VACUUM INTO 'file:///C:/data/compressed.db?vfs=sqmicro';
 
 -- sqmicro to plain, from a connection to the sqmicro database.
@@ -134,7 +132,7 @@ Open the source connection with `SQLITE_OPEN_URI`, and register sqmicro first.
 
 ## Benchmarks
 
-These results come from replaying a real 106-minute race (14 cars, 13.3 million rows, 2.7 GiB) on one Windows machine. They predate format version 2, which changed only the superblock checksum.
+These results come from replaying a real 106-minute race (14 cars, 13.3 million rows, 2.7 GiB) on one Windows machine. They predate format version 2, and the extra fsync that each checkpoint has needed since to survive a power loss.
 
 | | Size | vs original | Write time | After `compact` |
 | --- | ---: | ---: | ---: | ---: |
@@ -159,7 +157,7 @@ Read times with a warm cache, in milliseconds. sqmicro uses 16 KiB / 128 KiB / l
 | 500 random car states | 1.90 | 3.67 | 21.00 |
 | 500 random rows with wheel data | 9.28 | 12.79 | 155.90 |
 
-Full scans are close to the original. Random lookups are where the cost shows: about 0.3 ms per row with its wheel data. Polling for the newest rows took 0.05 ms at the median and 8.8 ms at the 99th percentile.
+Full scans are close to the original. Random lookups are where the cost shows: about 0.3 ms per row with its wheel data. Polling for the newest rows, on an otherwise idle database, took 0.05 ms at the median and 8.8 ms for the slowest of 60 polls.
 
 Run the benchmark yourself:
 
@@ -194,9 +192,9 @@ Only the main database file is intercepted. When SQLite checkpoints the WAL, run
 
 The file has three kinds of content:
 
-- **Superblocks.** Two 4 KiB slots at the start of the file, each with a generation number and a CRC-32. Writes alternate between them, so a torn write leaves the previous one usable.
+- **Superblocks.** Two 4 KiB slots at the start of the file, each with a generation number and a CRC-32. Writes alternate between them, and everything a superblock points to is synced before it is written, so a crash or power loss at any point leaves one that describes intact data.
 - **Page directory.** A two-level table that maps each SQLite page to its chunk. Updated parts are appended, then the next superblock points to them.
-- **Chunks.** Compressed with zstd and its content checksum. Page 1, and any chunk that doesn't shrink, is stored uncompressed.
+- **Chunks.** Compressed with zstd and its content checksum. Page 1, and any chunk that doesn't shrink, is stored uncompressed, without a checksum.
 
 Nothing is ever allocated in the 4 KiB at the 1 GiB mark, because SQLite takes mandatory locks there on Windows.
 
@@ -204,9 +202,10 @@ Files start with the bytes `SQMICRO1`, followed by a format version. This releas
 
 ## Limitations
 
-- **Use WAL mode.** In other journal modes, creating a *new* database with a transaction too large for SQLite's page cache (2 MB by default) fails with "database disk image is malformed". `VACUUM INTO` a sqmicro file is affected too, whatever the source's mode. Raising `PRAGMA cache_size` above the size of the data avoids it.
-- **Automatic compaction isn't crash-safe.** It rewrites the file in place, so a crash or power cut partway through can corrupt the database. Normal writes and `compact` don't overwrite live data.
-- **Windows is the main target.** Unix code paths exist but are experimental: sqmicro opens a second handle to each database, and closing it can release SQLite's POSIX locks held by other connections in the same process.
+- **Damage isn't always detected.** Superblocks and compressed data have checksums; the page directory, chunk headers and uncompressed chunks don't. A damaged directory can make pages read as zeros or as other pages.
+- **Windows is the main target.** Unix code paths exist but are experimental, and never compact automatically.
+- **I/O errors during a checkpoint.** SQLite ignores the result of a checkpoint's final flush. If that fails while a reader keeps the checkpoint from completing, sqmicro corrects SQLite's WAL index so that the data is still read from the WAL. A reader that starts in the instant before that can see old data in that one transaction.
+- **`synchronous=OFF` still syncs** whenever a superblock is written. `exclusive=1` in the URI isn't supported on Windows.
 - **Rust library only.** There is no loadable extension, so tools such as the `sqlite3` shell can't open the files. [Convert](#converting-databases) them first.
 - **No memory mapping.** `PRAGMA mmap_size` has no effect.
 
@@ -216,7 +215,7 @@ Files start with the bytes `SQMICRO1`, followed by a format version. This releas
 cargo test
 ```
 
-The tests cover SQLite behaviour across page sizes, recovery from torn superblocks, compaction alongside readers, and a writer and readers in separate processes.
+The tests cover SQLite behaviour across page sizes, simulated power loss and I/O errors, compaction alongside readers, and a writer and readers in separate processes.
 
 | Path | Contents |
 | --- | --- |

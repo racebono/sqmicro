@@ -15,6 +15,8 @@ pub const CHUNK_HEADER_SIZE: usize = 8;
 pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_CHUNK_PAGES: usize = 64;
 pub const MAX_FILE_OFFSET: u64 = (1u64 << 38) * 16;
+/// Far beyond any real generation or compact_id, and leaves room to increment them.
+const MAX_COUNTER: u64 = u64::MAX / 2;
 
 #[inline]
 pub fn align16(v: u64) -> u64 {
@@ -148,7 +150,7 @@ impl Superblock {
         }
         let flags = u32::from_le_bytes(buf[12..16].try_into().ok()?);
         let generation = u64::from_le_bytes(buf[16..24].try_into().ok()?);
-        if generation == 0 {
+        if generation == 0 || generation > MAX_COUNTER {
             return None;
         }
         let page_size = u32::from_le_bytes(buf[24..28].try_into().ok()?);
@@ -158,17 +160,28 @@ impl Superblock {
         let chunk_max_pages = u32::from_le_bytes(buf[28..32].try_into().ok()?);
         let page_count = u64::from_le_bytes(buf[32..40].try_into().ok()?);
         let tail_offset = u64::from_le_bytes(buf[40..48].try_into().ok()?);
-        if tail_offset < SUPERBLOCK_REGION || tail_offset % 16 != 0 {
+        if !(SUPERBLOCK_REGION..=MAX_FILE_OFFSET).contains(&tail_offset) || tail_offset % 16 != 0 {
+            return None;
+        }
+        let logical_bytes = page_count.checked_mul(page_size as u64)?;
+        if logical_bytes > i64::MAX as u64 || (page_count == 0) != (logical_bytes == 0) {
             return None;
         }
         let live_bytes = u64::from_le_bytes(buf[48..56].try_into().ok()?);
         let l1_offset = u64::from_le_bytes(buf[56..64].try_into().ok()?);
         let l1_entries = u32::from_le_bytes(buf[64..68].try_into().ok()?);
+        let l1_end = l1_offset.checked_add(l1_entries as u64 * 8)?;
+        if l1_entries as u64 != page_count.div_ceil(L2_ENTRIES as u64) || l1_end > tail_offset {
+            return None;
+        }
         let header_len = u32::from_le_bytes(buf[68..72].try_into().ok()?);
         if header_len != 0 && header_len != 100 {
             return None;
         }
         let compact_id = u64::from_le_bytes(buf[72..80].try_into().ok()?);
+        if compact_id > MAX_COUNTER {
+            return None;
+        }
         let dict_offset = u64::from_le_bytes(buf[80..88].try_into().ok()?);
         let dict_len = u32::from_le_bytes(buf[88..92].try_into().ok()?);
         let mut sqlite_header = [0u8; 100];
@@ -209,6 +222,15 @@ impl Superblock {
             (None, Some(sb)) => Some(sb),
             (None, None) => None,
         }
+    }
+
+    /// Whether a slot of this version doesn't decode, as when a concurrent write is caught halfway.
+    pub fn has_torn_slot(region: &[u8; SUPERBLOCK_REGION as usize]) -> bool {
+        region.chunks_exact(SUPERBLOCK_SIZE).any(|slot| {
+            slot[0..8] == MAGIC
+                && slot[8..12] == FORMAT_VERSION.to_le_bytes()
+                && Self::decode(slot.try_into().unwrap()).is_none()
+        })
     }
 
     /// Format version claimed by a sqmicro file this build cannot read. Only meaningful
@@ -399,6 +421,8 @@ mod tests {
         sb_a.generation = 1;
         sb_a.page_size = 16384;
         sb_a.page_count = 10;
+        sb_a.l1_offset = 0x2000;
+        sb_a.l1_entries = 1;
         sb_a.tail_offset = 0x2000 + 4096;
         sb_a.compact_id = 2;
         sb_a.header_len = 100;

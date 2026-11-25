@@ -2,17 +2,22 @@
 
 use crate::Config;
 use crate::cache::LruCache;
-use crate::codec::{ChunkInput, Decompressor, compress_chunks_parallel};
+use crate::codec::{ChunkInput, Decompressor, EncodedChunk, compress_chunks_parallel};
 use crate::error::{Error, Result};
 use crate::format::{
     CHUNK_HEADER_SIZE, ChunkHeader, DirEntry, L2_ENTRIES, L2_PAGE_SIZE, L2Page, MAX_CHUNK_BYTES,
-    MAX_CHUNK_PAGES, SUPERBLOCK_REGION, SUPERBLOCK_SIZE, Superblock, align16, alloc_offset,
-    is_valid_page_size, parse_sqlite_page_size,
+    MAX_CHUNK_PAGES, SUPERBLOCK_REGION, Superblock, align16, alloc_offset, is_valid_page_size,
+    parse_sqlite_page_size,
 };
 use std::collections::{BTreeMap, HashMap};
 
 const L2_CACHE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB (256 L2 pages = 131,072 inner pages)
 const PENDING_SPILL_CAP_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+// Readers wait while a live compaction rewrites the file, so these keep that well under a typical
+// busy timeout.
+const LIVE_COMPACT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const LIVE_COMPACT_MAX_LOGICAL_BYTES: u64 = 16 * 1024 * 1024;
 
 pub trait BlockIo {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize>;
@@ -118,29 +123,24 @@ pub struct PageStore<B: BlockIo> {
     pending_bytes: usize,
     dirty_l2: HashMap<u32, L2Page>,
     has_unflushed_spills: bool,
+    /// Consecutive superblock writes that failed, and so may or may not have reached the file.
+    failed_publishes: u64,
+
+    /// The superblock must be checked before the next read.
+    stale: bool,
 }
 
 impl<B: BlockIo> PageStore<B> {
     pub fn open(mut io: B, config: Config, read_only: bool) -> Result<Self> {
         let decompressor = Decompressor::new()?;
         let chunk_cache_bytes = config.cache_mib.saturating_mul(1024 * 1024);
-        let file_len = io.file_size()?;
-        let (superblock, l1) = if file_len == 0 {
-            (None, Vec::new())
-        } else {
-            let sb = read_superblock(&mut io)?.ok_or(Error::NotASqmicroDb)?;
-            let l1 = read_l1(&mut io, &sb)?;
-            (Some(sb), l1)
+        let superblock = read_superblock(&mut io, 0)?;
+        let l1 = match &superblock {
+            Some(sb) => read_l1(&mut io, sb)?,
+            None => Vec::new(),
         };
 
-        let staged_page_size = superblock.as_ref().map_or(0, |sb| sb.page_size);
-        let staged_page_count = superblock.as_ref().map_or(0, |sb| sb.page_count);
-        let staged_tail_offset = superblock
-            .as_ref()
-            .map_or(SUPERBLOCK_REGION, |sb| sb.tail_offset);
-        let staged_live_bytes = superblock.as_ref().map_or(0, |sb| sb.live_bytes);
-
-        Ok(Self {
+        let mut store = Self {
             io,
             config,
             read_only,
@@ -149,44 +149,77 @@ impl<B: BlockIo> PageStore<B> {
             l2_cache: LruCache::new(L2_CACHE_MAX_BYTES),
             chunk_cache: LruCache::new(chunk_cache_bytes),
             decompressor,
-            staged_page_size,
-            staged_page_count,
-            staged_tail_offset,
-            staged_live_bytes,
+            staged_page_size: 0,
+            staged_page_count: 0,
+            staged_tail_offset: SUPERBLOCK_REGION,
+            staged_live_bytes: 0,
             staged_header: None,
             pending_writes: BTreeMap::new(),
             pending_bytes: 0,
             dirty_l2: HashMap::new(),
             has_unflushed_spills: false,
-        })
+            failed_publishes: 0,
+            stale: false,
+        };
+        store.reset_staged();
+        Ok(store)
+    }
+
+    /// Makes the staged geometry match the committed superblock.
+    fn reset_staged(&mut self) {
+        let sb = self.superblock.as_ref();
+        self.staged_page_size = sb.map_or(0, |sb| sb.page_size);
+        self.staged_page_count = sb.map_or(0, |sb| sb.page_count);
+        self.staged_tail_offset = sb.map_or(SUPERBLOCK_REGION, |sb| sb.tail_offset);
+        self.staged_live_bytes = sb.map_or(0, |sb| sb.live_bytes);
+        self.failed_publishes = 0;
+    }
+
+    /// Drops everything that hasn't been published. Must be called when a flush has failed and the
+    /// lock that protected it is about to be released: from then on another connection may publish
+    /// its own changes, which these must not overwrite. The WAL or journal still has the pages.
+    pub fn discard_staged(&mut self) {
+        self.pending_writes.clear();
+        self.pending_bytes = 0;
+        self.dirty_l2.clear();
+        self.staged_header = None;
+        self.has_unflushed_spills = false;
+        // Spilled chunks may be cached under offsets that the next writer will use.
+        self.chunk_cache.clear();
+        self.reset_staged();
+        self.stale = true;
+    }
+
+    /// Asks for `refresh` to run before the next read.
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.stale
     }
 
     pub fn refresh(&mut self) -> Result<()> {
         if self.has_pending_writes() {
             return Ok(());
         }
-        let file_len = self.io.file_size()?;
-        if file_len == 0 {
-            if self.superblock.is_some() {
-                self.superblock = None;
+        let held_generation = self.superblock.as_ref().map_or(0, |sb| sb.generation);
+        let Some(new_sb) = read_superblock(&mut self.io, held_generation)? else {
+            if self.superblock.take().is_some() {
                 self.l1.clear();
                 self.l2_cache.clear();
                 self.chunk_cache.clear();
-                self.staged_page_size = 0;
-                self.staged_page_count = 0;
-                self.staged_tail_offset = SUPERBLOCK_REGION;
-                self.staged_live_bytes = 0;
+                self.reset_staged();
             }
+            self.stale = false;
             return Ok(());
-        }
-        let Some(new_sb) = read_superblock(&mut self.io)? else {
-            return Err(Error::NotASqmicroDb);
         };
 
         let same_gen = self.superblock.as_ref().is_some_and(|old| {
             old.generation == new_sb.generation && old.compact_id == new_sb.compact_id
         });
         if same_gen {
+            self.stale = false;
             return Ok(());
         }
 
@@ -210,12 +243,10 @@ impl<B: BlockIo> PageStore<B> {
             }
         }
 
-        self.staged_page_size = new_sb.page_size;
-        self.staged_page_count = new_sb.page_count;
-        self.staged_tail_offset = new_sb.tail_offset;
-        self.staged_live_bytes = new_sb.live_bytes;
         self.l1 = new_l1;
         self.superblock = Some(new_sb);
+        self.reset_staged();
+        self.stale = false;
         Ok(())
     }
 
@@ -300,13 +331,17 @@ impl<B: BlockIo> PageStore<B> {
             self.refresh()?;
         }
 
+        // The store keeps the page size of its first write until it is emptied, even if SQLite's page
+        // size changes later (`PRAGMA page_size` and `VACUUM`).
         if self.staged_page_size == 0 {
-            if offset != 0 {
-                return Err(Error::Corrupt(format!(
-                    "first write to empty database at non-zero offset {offset}"
-                )));
-            }
-            let ps = parse_sqlite_page_size(data)
+            // SQLite writes whole pages, but not always page 1 first, so only a write at offset 0
+            // has a header to look at.
+            let header_ps = if offset == 0 {
+                parse_sqlite_page_size(data)
+            } else {
+                None
+            };
+            let ps = header_ps
                 .filter(|&ps| data.len() % ps as usize == 0)
                 .or_else(|| {
                     let len = u32::try_from(data.len()).ok()?;
@@ -319,25 +354,28 @@ impl<B: BlockIo> PageStore<B> {
                     ))
                 })?;
             self.staged_page_size = ps;
-        } else if offset == 0
-            && let Some(new_ps) = parse_sqlite_page_size(data)
-            && new_ps != self.staged_page_size
-            && data.len() % new_ps as usize == 0
-        {
-            // PRAGMA page_size = N; VACUUM; rewrites the database starting at offset 0 with a new page size.
-            self.pending_writes.clear();
-            self.pending_bytes = 0;
-            self.dirty_l2.clear();
-            self.l1.clear();
-            self.l2_cache.clear();
-            self.chunk_cache.clear();
-            self.staged_page_size = new_ps;
-            self.staged_page_count = 0;
-            self.staged_live_bytes = 0;
-            self.has_unflushed_spills = true;
         }
 
         let ps = self.staged_page_size as usize;
+
+        // A page smaller than the store's is merged into the store page that contains it.
+        let merged;
+        let (offset, data) = if data.len() < ps
+            && data.len().is_power_of_two()
+            && offset % data.len() as u64 == 0
+        {
+            let at = (offset % ps as u64) as usize;
+            let pgno = 1 + offset / ps as u64;
+            let mut page = vec![0u8; ps];
+            if pgno <= self.staged_page_count {
+                self.read_page_slice(pgno, 0, &mut page)?;
+            }
+            page[at..at + data.len()].copy_from_slice(data);
+            merged = page;
+            (offset - at as u64, merged.as_slice())
+        } else {
+            (offset, data)
+        };
         if offset % ps as u64 != 0 || data.len() % ps != 0 {
             return Err(Error::Corrupt(format!(
                 "unaligned write: offset={offset}, len={}, page_size={ps}",
@@ -415,27 +453,8 @@ impl<B: BlockIo> PageStore<B> {
             new_l1[l2_idx as usize] = l2_off;
         }
 
-        // Write immutable L1 root.
-        let l1_offset = if l1_entries == 0 {
-            0
-        } else {
-            let raw_l1_bytes = l1_entries * 8;
-            let aligned_l1_bytes = align16(raw_l1_bytes as u64);
-            let mut l1_buf = vec![0u8; aligned_l1_bytes as usize];
-            for (i, &off) in new_l1.iter().enumerate() {
-                l1_buf[i * 8..i * 8 + 8].copy_from_slice(&off.to_le_bytes());
-            }
-            let (off, next_tail) = alloc_offset(tail, aligned_l1_bytes)?;
-            self.io.write_at(off, &l1_buf)?;
-            tail = next_tail;
-            off
-        };
+        let (l1_offset, tail) = self.write_l1(&new_l1, tail)?;
 
-        if sync_disk {
-            self.io.sync()?;
-        }
-
-        let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
         let prev_compact = self.superblock.as_ref().map_or(0, |sb| sb.compact_id);
         let (header_len, sqlite_header) = if let Some(hdr) = self.staged_header {
             (100, hdr)
@@ -449,7 +468,7 @@ impl<B: BlockIo> PageStore<B> {
         let sb = Superblock {
             format_version: crate::format::FORMAT_VERSION,
             flags: 0,
-            generation: prev_gen + 1,
+            generation: 0, // set by publish()
             page_size,
             chunk_max_pages,
             page_count,
@@ -464,11 +483,7 @@ impl<B: BlockIo> PageStore<B> {
             sqlite_header,
         };
 
-        let encoded_sb = sb.encode();
-        self.io.write_at(sb.slot_offset(), &encoded_sb)?;
-        if sync_disk {
-            self.io.sync()?;
-        }
+        self.publish(sb)?;
 
         // Disk publication succeeded: now commit in-memory state.
         for l2_idx in dirty_indices {
@@ -479,11 +494,48 @@ impl<B: BlockIo> PageStore<B> {
             }
         }
         self.staged_header = None;
-        self.staged_tail_offset = tail;
-        self.staged_live_bytes = sb.live_bytes;
         self.l1 = new_l1;
-        self.superblock = Some(sb);
         self.has_unflushed_spills = false;
+
+        // Other connections can see the new superblock, so if this fails the in-memory commit above
+        // still stands.
+        if sync_disk {
+            self.io.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Writes an immutable L1 root at `tail`. Returns its offset and the new tail.
+    fn write_l1(&mut self, l1: &[u64], tail: u64) -> Result<(u64, u64)> {
+        if l1.is_empty() {
+            return Ok((0, tail));
+        }
+        let mut buf = vec![0u8; align16((l1.len() * 8) as u64) as usize];
+        for (slot, off) in buf.chunks_exact_mut(8).zip(l1) {
+            slot.copy_from_slice(&off.to_le_bytes());
+        }
+        let (off, next_tail) = alloc_offset(tail, buf.len() as u64)?;
+        self.io.write_at(off, &buf)?;
+        Ok((off, next_tail))
+    }
+
+    /// Makes `sb` the current superblock, with the next generation number.
+    ///
+    /// Everything written so far is made durable first. That covers both the data `sb` points to
+    /// and the previous superblock, so a crash always leaves a slot that describes intact data.
+    fn publish(&mut self, mut sb: Superblock) -> Result<()> {
+        let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
+        sb.generation = prev_gen + 1 + 2 * self.failed_publishes;
+        self.io.sync()?;
+        self.staged_tail_offset = sb.tail_offset;
+        if let Err(e) = self.io.write_at(sb.slot_offset(), &sb.encode()) {
+            // Other connections may already see this superblock. A retry must leave the space it
+            // points to alone, and use a new generation in the same slot.
+            self.failed_publishes += 1;
+            return Err(e);
+        }
+        self.superblock = Some(sb);
+        self.reset_staged();
         Ok(())
     }
 
@@ -518,12 +570,8 @@ impl<B: BlockIo> PageStore<B> {
             )));
         }
         let ps_u64 = page_size as u64;
-        if new_size % ps_u64 != 0 {
-            return Err(Error::Corrupt(format!(
-                "unaligned truncate size {new_size} for page_size {page_size}"
-            )));
-        }
-        let new_page_count = new_size / ps_u64;
+        // Rounded up: a smaller SQLite page size leaves sizes that aren't whole store pages.
+        let new_page_count = new_size.div_ceil(ps_u64);
         if new_page_count >= old_page_count {
             return Ok(());
         }
@@ -570,54 +618,26 @@ impl<B: BlockIo> PageStore<B> {
         let live_uncompressed_bytes = new_page_count.saturating_mul(ps_u64);
         let should_live_compact = (new_page_count == 0 && physical_data > 0)
             || (self.config.compact_threshold > 0
-                && exact_live_bytes <= 16 * 1024 * 1024
-                && live_uncompressed_bytes <= 64 * 1024 * 1024
+                && exact_live_bytes <= LIVE_COMPACT_MAX_BYTES
+                && live_uncompressed_bytes <= LIVE_COMPACT_MAX_LOGICAL_BYTES
                 && dead_bytes >= 4 * 1024 * 1024
                 && dead_bytes.saturating_mul(100)
                     >= physical_data.saturating_mul(self.config.compact_threshold as u64));
-
-        if should_live_compact
-            && let Some(lock) = compact_lock
-            && lock.try_lock_exclusive()?
-        {
-            struct UnlockGuard<'a>(&'a crate::lock::CompactLock);
-            impl Drop for UnlockGuard<'_> {
-                fn drop(&mut self) {
-                    let _ = self.0.unlock();
-                }
-            }
-            let _guard = UnlockGuard(lock);
-            return self.live_compact_to(new_page_count, page_size);
-        }
 
         // Logical truncate (safe with concurrent readers; no live bytes overwritten).
         let mut new_l1 = self.l1[..new_l1_entries.min(self.l1.len())].to_vec();
         new_l1.resize(new_l1_entries, 0);
         let mut tail = self.staged_tail_offset;
 
-        if let Some((l2_idx, l2_page)) = trimmed_last_l2 {
+        if let Some((l2_idx, l2_page)) = &trimmed_last_l2 {
             let (l2_off, next_tail) = alloc_offset(tail, L2_PAGE_SIZE as u64)?;
             self.io.write_at(l2_off, &l2_page.encode())?;
             tail = next_tail;
-            new_l1[l2_idx as usize] = l2_off;
-            self.l2_cache.insert(l2_idx, l2_page, L2_PAGE_SIZE);
+            new_l1[*l2_idx as usize] = l2_off;
         }
 
-        let l1_offset = if new_l1_entries == 0 {
-            0
-        } else {
-            let aligned_l1_bytes = align16((new_l1_entries * 8) as u64);
-            let mut l1_buf = vec![0u8; aligned_l1_bytes as usize];
-            for (i, &off) in new_l1.iter().enumerate() {
-                l1_buf[i * 8..i * 8 + 8].copy_from_slice(&off.to_le_bytes());
-            }
-            let (off, next_tail) = alloc_offset(tail, aligned_l1_bytes)?;
-            self.io.write_at(off, &l1_buf)?;
-            tail = next_tail;
-            off
-        };
+        let (l1_offset, tail) = self.write_l1(&new_l1, tail)?;
 
-        let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
         let prev_compact = self.superblock.as_ref().map_or(0, |sb| sb.compact_id);
         let (header_len, sqlite_header) = if new_page_count == 0 {
             (0, [0u8; 100])
@@ -631,7 +651,7 @@ impl<B: BlockIo> PageStore<B> {
         let sb = Superblock {
             format_version: crate::format::FORMAT_VERSION,
             flags: 0,
-            generation: prev_gen + 1,
+            generation: 0, // set by publish()
             page_size: effective_page_size,
             chunk_max_pages: self.chunk_pages_limit(effective_page_size) as u32,
             page_count: new_page_count,
@@ -645,133 +665,117 @@ impl<B: BlockIo> PageStore<B> {
             dict_len: 0,
             sqlite_header,
         };
-        self.io.write_at(sb.slot_offset(), &sb.encode())?;
+        self.publish(sb)?;
 
         // Evict dropped L2 pages from cache.
         for idx in new_l1_entries..self.l1.len() {
             self.l2_cache.remove(&(idx as u32));
         }
-        self.staged_page_size = effective_page_size;
-        self.staged_page_count = new_page_count;
-        self.staged_tail_offset = tail;
-        self.staged_live_bytes = sb.live_bytes;
+        if let Some((l2_idx, l2_page)) = trimmed_last_l2 {
+            self.l2_cache.insert(l2_idx, l2_page, L2_PAGE_SIZE);
+        }
         self.l1 = new_l1;
-        self.superblock = Some(sb);
+
+        // The truncation is done. Reclaiming the space is best effort: if it fails, whatever was
+        // published last still describes intact data.
+        if should_live_compact
+            && let Some(lock) = compact_lock
+            && self.live_compact(lock).is_err()
+        {
+            self.discard_staged();
+        }
         Ok(())
     }
 
-    fn live_compact_to(&mut self, new_page_count: u64, page_size: u32) -> Result<()> {
-        let ps = page_size as usize;
-        let mut live_pages: Vec<(u64, Vec<u8>)> = Vec::with_capacity(new_page_count as usize);
-        let mut header_mirror = [0u8; 100];
-        let mut header_len = 0u32;
-
-        for pgno in 1..=new_page_count {
-            let entry = self.lookup_dir_entry(pgno)?;
-            if entry.is_empty() {
-                continue;
+    /// Rewrites the database at the start of the file and cuts off the rest.
+    ///
+    /// The old data can't be overwritten while a superblock still needs it, so a complete copy is
+    /// first published past the end. A crash at any point leaves one intact copy published.
+    fn live_compact(&mut self, lock: &crate::lock::CompactLock) -> Result<()> {
+        // Read and compress first, so that readers only wait for the rewrite itself.
+        let page_size = self.staged_page_size;
+        let mut pages = Vec::new();
+        for pgno in 1..=self.staged_page_count {
+            if !self.is_page_empty(pgno)? {
+                let mut buf = vec![0u8; page_size as usize];
+                self.read_page_slice(pgno, 0, &mut buf)?;
+                pages.push((pgno, buf));
             }
-            let mut buf = vec![0u8; ps];
-            self.read_page_slice(pgno, 0, &mut buf)?;
-            if pgno == 1 && buf.len() >= 100 {
-                header_mirror.copy_from_slice(&buf[..100]);
-                header_len = 100;
+        }
+        let chunks = compress_chunks_parallel(
+            group_chunks(
+                pages.iter().map(|(pgno, data)| (*pgno, data.as_slice())),
+                self.chunk_pages_limit(page_size),
+            ),
+            self.config.level,
+            self.config.threads,
+        )?;
+
+        let old_tail = self.staged_tail_offset;
+        let l1_entries = self.l1.len() as u64;
+        let packed_bytes = chunks.iter().map(|c| c.block.len() as u64).sum::<u64>()
+            + l1_entries * L2_PAGE_SIZE as u64
+            + align16(l1_entries * 8);
+        if SUPERBLOCK_REGION + packed_bytes > old_tail || !lock.try_lock_exclusive()? {
+            return Ok(());
+        }
+        struct UnlockGuard<'a>(&'a crate::lock::CompactLock);
+        impl Drop for UnlockGuard<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.unlock();
             }
-            live_pages.push((pgno, buf));
         }
+        let _guard = UnlockGuard(lock);
 
-        let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
-        let prev_compact = self.superblock.as_ref().map_or(0, |sb| sb.compact_id);
+        let (sb, l1) = self.write_copy(&chunks, old_tail)?;
+        self.publish_copy(sb, l1)?;
+        self.io.sync()?; // the copy must be what a crash falls back to before its source goes
 
-        // Reset in-memory layout and rewrite compactly from SUPERBLOCK_REGION.
-        self.l1.clear();
-        self.l2_cache.clear();
-        self.chunk_cache.clear();
-        self.dirty_l2.clear();
-        self.pending_writes.clear();
-        self.pending_bytes = 0;
-        self.has_unflushed_spills = false;
-        self.staged_page_size = page_size;
-        self.staged_page_count = new_page_count;
-        self.staged_tail_offset = SUPERBLOCK_REGION;
-        self.staged_live_bytes = 0;
+        let (mut sb, l1) = self.write_copy(&chunks, SUPERBLOCK_REGION)?;
+        sb.compact_id += 1; // offsets are reused, so readers must drop their caches
+        self.publish_copy(sb, l1)?;
+        self.io.sync()?;
 
-        for (pgno, data) in live_pages {
-            self.pending_bytes += data.len();
-            self.pending_writes.insert(pgno, data);
+        let _ = self.io.truncate(self.staged_tail_offset);
+        Ok(())
+    }
+
+    /// Writes `chunks` and a directory for them from `base` on. Returns the matching superblock,
+    /// otherwise like the current one, and L1.
+    fn write_copy(&mut self, chunks: &[EncodedChunk], base: u64) -> Result<(Superblock, Vec<u64>)> {
+        let mut sb = self
+            .superblock
+            .clone()
+            .ok_or_else(|| Error::Corrupt("no superblock to copy".into()))?;
+        let (mut tail, mut live_bytes, entries) = self.write_chunks(chunks, base)?;
+
+        let mut l2_pages = BTreeMap::new();
+        for (pgno, entry) in entries {
+            let idx = pgno - 1;
+            l2_pages
+                .entry((idx / L2_ENTRIES as u64) as usize)
+                .or_insert_with(L2Page::empty)
+                .entries[(idx % L2_ENTRIES as u64) as usize] = entry;
         }
-        self.spill_pending_chunks()?;
-
-        let new_l1_entries = if new_page_count == 0 {
-            0usize
-        } else {
-            ((new_page_count - 1) / L2_ENTRIES as u64 + 1) as usize
-        };
-        let mut new_l1 = vec![0u64; new_l1_entries];
-        let mut tail = self.staged_tail_offset;
-        let mut live_bytes = self.staged_live_bytes;
-
-        let mut dirty_indices: Vec<u32> = self.dirty_l2.keys().copied().collect();
-        dirty_indices.sort_unstable();
-        for l2_idx in dirty_indices {
-            let page = self.dirty_l2.remove(&l2_idx).unwrap();
+        let mut l1 = vec![0u64; self.l1.len()];
+        for (l2_idx, page) in l2_pages {
             let (l2_off, next_tail) = alloc_offset(tail, L2_PAGE_SIZE as u64)?;
             self.io.write_at(l2_off, &page.encode())?;
+            l1[l2_idx] = l2_off;
             tail = next_tail;
-            live_bytes = live_bytes.saturating_add(L2_PAGE_SIZE as u64);
-            new_l1[l2_idx as usize] = l2_off;
-            self.l2_cache.insert(l2_idx, page, L2_PAGE_SIZE);
+            live_bytes += L2_PAGE_SIZE as u64;
         }
 
-        let l1_offset = if new_l1_entries == 0 {
-            0
-        } else {
-            let aligned_l1_bytes = align16((new_l1_entries * 8) as u64);
-            let mut l1_buf = vec![0u8; aligned_l1_bytes as usize];
-            for (i, &off) in new_l1.iter().enumerate() {
-                l1_buf[i * 8..i * 8 + 8].copy_from_slice(&off.to_le_bytes());
-            }
-            let (off, next_tail) = alloc_offset(tail, aligned_l1_bytes)?;
-            self.io.write_at(off, &l1_buf)?;
-            tail = next_tail;
-            live_bytes = live_bytes.saturating_add(aligned_l1_bytes);
-            off
-        };
+        (sb.l1_offset, sb.tail_offset) = self.write_l1(&l1, tail)?;
+        sb.live_bytes = live_bytes;
+        Ok((sb, l1))
+    }
 
-        self.io.sync()?;
-
-        let effective_page_size = if new_page_count == 0 { 0 } else { page_size };
-        let sb = Superblock {
-            format_version: crate::format::FORMAT_VERSION,
-            flags: 0,
-            generation: prev_gen + 1,
-            page_size: effective_page_size,
-            chunk_max_pages: self.chunk_pages_limit(effective_page_size) as u32,
-            page_count: new_page_count,
-            tail_offset: tail,
-            live_bytes: live_bytes.min(tail.saturating_sub(SUPERBLOCK_REGION)),
-            l1_offset,
-            l1_entries: new_l1_entries as u32,
-            header_len,
-            compact_id: prev_compact + 1,
-            dict_offset: 0,
-            dict_len: 0,
-            sqlite_header: header_mirror,
-        };
-        let encoded_sb = sb.encode();
-        // Write both slots so neither superblock slot references truncated offsets.
-        self.io.write_at(0, &encoded_sb)?;
-        self.io.write_at(SUPERBLOCK_SIZE as u64, &encoded_sb)?;
-        self.io.sync()?;
-        self.io.truncate(tail)?;
-        self.io.sync()?;
-
-        self.staged_page_size = effective_page_size;
-        self.staged_tail_offset = tail;
-        self.staged_live_bytes = sb.live_bytes;
-        self.l1 = new_l1;
-        self.superblock = Some(sb);
-        self.has_unflushed_spills = false;
+    fn publish_copy(&mut self, sb: Superblock, l1: Vec<u64>) -> Result<()> {
+        self.publish(sb)?;
+        self.l1 = l1;
+        self.l2_cache.clear();
+        self.chunk_cache.clear();
         Ok(())
     }
 
@@ -825,68 +829,26 @@ impl<B: BlockIo> PageStore<B> {
             let mut init_sb = Superblock::empty();
             init_sb.generation = 1;
             self.io.write_at(init_sb.slot_offset(), &init_sb.encode())?;
+            self.io.sync()?;
             self.superblock = Some(init_sb);
         }
 
         let page_size = self.staged_page_size;
         let max_pages = self.chunk_pages_limit(page_size);
 
-        // Build ChunkInput groups without clearing pending_writes until disk writes succeed.
-        let mut inputs: Vec<ChunkInput> = Vec::new();
-        let mut current: Vec<(u64, &[u8])> = Vec::new();
-        for (&pgno, data) in &self.pending_writes {
-            if pgno == 1 {
-                if !current.is_empty() {
-                    inputs.push(ChunkInput {
-                        pages: std::mem::take(&mut current),
-                        force_raw: false,
-                    });
-                }
-                inputs.push(ChunkInput {
-                    pages: vec![(1, data)],
-                    force_raw: true,
-                });
-                continue;
-            }
-            let contiguous = current
-                .last()
-                .is_none_or(|(last_pgno, _)| *last_pgno + 1 == pgno);
-            if !contiguous || current.len() >= max_pages {
-                inputs.push(ChunkInput {
-                    pages: std::mem::take(&mut current),
-                    force_raw: false,
-                });
-            }
-            current.push((pgno, data));
-        }
-        if !current.is_empty() {
-            inputs.push(ChunkInput {
-                pages: current,
-                force_raw: false,
-            });
-        }
-
-        let encoded_chunks =
-            compress_chunks_parallel(inputs, self.config.level, self.config.threads)?;
-
-        let mut next_tail = self.staged_tail_offset;
-        let mut added_live_bytes = 0u64;
-        let mut staged_entries: Vec<(u64, DirEntry)> = Vec::new();
-
-        for chunk in encoded_chunks {
-            let block_len = chunk.block.len() as u64;
-            let (chunk_off, new_tail) = alloc_offset(next_tail, block_len)?;
-            self.io.write_at(chunk_off, &chunk.block)?;
-
-            next_tail = new_tail;
-            added_live_bytes = added_live_bytes.saturating_add(block_len);
-
-            let read_len = chunk.read_len();
-            for (slot_idx, pgno) in chunk.pagenos.into_iter().enumerate() {
-                let entry = DirEntry::new(chunk_off, read_len, slot_idx as u8)?;
-                staged_entries.push((pgno, entry));
-            }
-        }
+        // Nothing staged changes until the disk writes succeed.
+        let encoded_chunks = compress_chunks_parallel(
+            group_chunks(
+                self.pending_writes
+                    .iter()
+                    .map(|(&pgno, data)| (pgno, data.as_slice())),
+                max_pages,
+            ),
+            self.config.level,
+            self.config.threads,
+        )?;
+        let (next_tail, added_live_bytes, staged_entries) =
+            self.write_chunks(&encoded_chunks, self.staged_tail_offset)?;
 
         // All disk writes succeeded: now apply staged directory updates and clear pending_writes.
         let mut updated_l2 = self.dirty_l2.clone();
@@ -907,6 +869,28 @@ impl<B: BlockIo> PageStore<B> {
         self.pending_bytes = 0;
         self.has_unflushed_spills = true;
         Ok(())
+    }
+
+    /// Writes `chunks` from `tail` on. Returns the new tail, the bytes used, and where each page went.
+    fn write_chunks(
+        &mut self,
+        chunks: &[EncodedChunk],
+        mut tail: u64,
+    ) -> Result<(u64, u64, Vec<(u64, DirEntry)>)> {
+        let mut bytes = 0u64;
+        let mut entries = Vec::new();
+        for chunk in chunks {
+            let block_len = chunk.block.len() as u64;
+            let (chunk_off, next_tail) = alloc_offset(tail, block_len)?;
+            self.io.write_at(chunk_off, &chunk.block)?;
+            tail = next_tail;
+            bytes += block_len;
+            for (slot_idx, &pgno) in chunk.pagenos.iter().enumerate() {
+                let entry = DirEntry::new(chunk_off, chunk.read_len(), slot_idx as u8)?;
+                entries.push((pgno, entry));
+            }
+        }
+        Ok((tail, bytes, entries))
     }
 
     fn set_dirty_dir_entry(&mut self, pgno: u64, entry: DirEntry) -> Result<()> {
@@ -1025,18 +1009,61 @@ impl<B: BlockIo> PageStore<B> {
     }
 }
 
-fn read_superblock<B: BlockIo>(io: &mut B) -> Result<Option<Superblock>> {
+/// Groups runs of neighbouring pages into chunks. Page 1 gets its own uncompressed chunk.
+fn group_chunks<'a>(
+    pages: impl Iterator<Item = (u64, &'a [u8])>,
+    max_pages: usize,
+) -> Vec<ChunkInput<'a>> {
+    let mut chunks: Vec<ChunkInput<'a>> = Vec::new();
+    for (pgno, data) in pages {
+        match chunks.last_mut() {
+            Some(chunk)
+                if !chunk.force_raw
+                    && chunk.pages.len() < max_pages
+                    && chunk.pages.last().is_some_and(|(last, _)| last + 1 == pgno) =>
+            {
+                chunk.pages.push((pgno, data));
+            }
+            _ => chunks.push(ChunkInput {
+                pages: vec![(pgno, data)],
+                force_raw: pgno == 1,
+            }),
+        }
+    }
+    chunks
+}
+
+/// Returns `None` for an empty database: an empty file, or one that only got as far as zeros when
+/// a crash interrupted its first superblock write.
+fn read_superblock<B: BlockIo>(io: &mut B, held_generation: u64) -> Result<Option<Superblock>> {
     let mut region = [0u8; SUPERBLOCK_REGION as usize];
-    let n = io.read_at(0, &mut region)?;
-    if n < SUPERBLOCK_SIZE {
-        return Ok(None);
-    }
-    if let Some(sb) = Superblock::select_latest(&region) {
-        return Ok(Some(sb));
-    }
-    match Superblock::unsupported_version(&region) {
-        Some(version) => Err(Error::UnsupportedVersion(version)),
-        None => Ok(None),
+    let mut retries = 4;
+    loop {
+        region.fill(0);
+        io.read_at(0, &mut region)?;
+        let found = Superblock::select_latest(&region);
+
+        // Another process may be writing a slot right now. Look again before settling for the other
+        // one, but do settle: a crash can leave a torn slot for good.
+        let suspicious = Superblock::has_torn_slot(&region)
+            || found
+                .as_ref()
+                .is_some_and(|sb| sb.generation < held_generation);
+        if suspicious && retries > 0 {
+            retries -= 1;
+            std::thread::yield_now();
+            continue;
+        }
+        if found.is_some() {
+            return Ok(found);
+        }
+        if region.iter().all(|&b| b == 0) && io.file_size()? <= SUPERBLOCK_REGION {
+            return Ok(None);
+        }
+        return Err(match Superblock::unsupported_version(&region) {
+            Some(version) => Error::UnsupportedVersion(version),
+            None => Error::NotASqmicroDb,
+        });
     }
 }
 
@@ -1048,13 +1075,14 @@ fn read_l1<B: BlockIo>(io: &mut B, sb: &Superblock) -> Result<Vec<u64>> {
     let byte_len = count
         .checked_mul(8)
         .ok_or_else(|| Error::Corrupt("l1_entries overflow".into()))?;
+    let truncated = || Error::Corrupt(format!("truncated L1 root at offset {}", sb.l1_offset));
+    // Checked before allocating, so a bad count can't ask for gigabytes.
+    if sb.l1_offset.saturating_add(byte_len as u64) > io.file_size()? {
+        return Err(truncated());
+    }
     let mut buf = vec![0u8; byte_len];
-    let n = io.read_at(sb.l1_offset, &mut buf)?;
-    if n != byte_len {
-        return Err(Error::Corrupt(format!(
-            "truncated L1 root at offset {}: expected {byte_len}, got {n}",
-            sb.l1_offset
-        )));
+    if io.read_at(sb.l1_offset, &mut buf)? != byte_len {
+        return Err(truncated());
     }
     let mut out = Vec::with_capacity(count);
     for chunk in buf.chunks_exact(8) {
@@ -1502,5 +1530,550 @@ mod tests {
             compact_id_before,
             "live compaction must skip when live uncompressed bytes exceed 64 MiB"
         );
+    }
+
+    /// Keeps the operations since the last sync, to build the files a power loss could leave.
+    #[derive(Clone, Default)]
+    struct CrashIo(Rc<RefCell<CrashState>>);
+
+    #[derive(Default)]
+    struct CrashState {
+        current: Vec<u8>,
+        durable: Vec<u8>,
+        unsynced: Vec<Op>,
+        /// Files a crash at any point so far could have left.
+        crashes: Vec<Vec<u8>>,
+        record: bool,
+        /// Fail the write at this offset once the file has it (`true`) or before (`false`).
+        fail_write: Option<(u64, bool)>,
+        fail_sync: bool,
+        fail_truncate: bool,
+    }
+
+    #[derive(Clone)]
+    enum Op {
+        Write(u64, Vec<u8>),
+        Truncate(u64),
+    }
+
+    impl Op {
+        fn apply(&self, file: &mut Vec<u8>) {
+            match self {
+                Op::Write(off, data) => {
+                    let end = *off as usize + data.len();
+                    if file.len() < end {
+                        file.resize(end, 0);
+                    }
+                    file[*off as usize..end].copy_from_slice(data);
+                }
+                Op::Truncate(len) => file.resize(*len as usize, 0),
+            }
+        }
+    }
+
+    fn injected() -> Error {
+        std::io::Error::other("injected fault").into()
+    }
+
+    impl CrashState {
+        fn push(&mut self, op: Op) {
+            op.apply(&mut self.current);
+            self.unsynced.push(op);
+            if !self.record {
+                return;
+            }
+            // Any subset of the unsynced operations may have reached the disk. Subsets without the
+            // newest one were covered before it: try it alone, with all others, and with each one
+            // missing.
+            let newest = self.unsynced.len() - 1;
+            let mut keeps: Vec<Box<dyn Fn(usize) -> bool>> =
+                vec![Box::new(move |k| k == newest), Box::new(|_| true)];
+            for i in 0..newest {
+                keeps.push(Box::new(move |k| k != i));
+            }
+            for keep in keeps {
+                let mut file = self.durable.clone();
+                for (k, op) in self.unsynced.iter().enumerate() {
+                    if keep(k) {
+                        op.apply(&mut file);
+                    }
+                }
+                self.crashes.push(file);
+            }
+        }
+    }
+
+    impl BlockIo for CrashIo {
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            let s = self.0.borrow();
+            let off = (offset as usize).min(s.current.len());
+            let n = (s.current.len() - off).min(buf.len());
+            buf[..n].copy_from_slice(&s.current[off..off + n]);
+            Ok(n)
+        }
+        fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut s = self.0.borrow_mut();
+            let fail = s.fail_write.filter(|(off, _)| *off == offset);
+            if fail.is_none_or(|(_, written)| written) {
+                s.push(Op::Write(offset, buf.to_vec()));
+            }
+            match fail {
+                Some(_) => Err(injected()),
+                None => Ok(()),
+            }
+        }
+        fn sync(&mut self) -> Result<()> {
+            let mut s = self.0.borrow_mut();
+            if s.fail_sync {
+                return Err(injected());
+            }
+            s.durable = s.current.clone();
+            s.unsynced.clear();
+            Ok(())
+        }
+        fn file_size(&mut self) -> Result<u64> {
+            Ok(self.0.borrow().current.len() as u64)
+        }
+        fn truncate(&mut self, size: u64) -> Result<()> {
+            let mut s = self.0.borrow_mut();
+            if s.fail_truncate {
+                return Err(injected());
+            }
+            s.push(Op::Truncate(size));
+            Ok(())
+        }
+    }
+
+    impl CrashIo {
+        fn from_file(file: Vec<u8>) -> Self {
+            let io = Self::default();
+            io.0.borrow_mut().current = file;
+            io
+        }
+        /// The next superblock goes to this offset.
+        fn next_slot(&self, store: &PageStore<CrashIo>) -> u64 {
+            let mut sb = Superblock::empty();
+            sb.generation = store.superblock().map_or(0, |sb| sb.generation) + 1;
+            sb.slot_offset()
+        }
+    }
+
+    const PS: usize = 4096;
+
+    /// A page that is recognizable and doesn't compress, so compaction has something to reclaim.
+    fn page(tag: u64) -> Vec<u8> {
+        let mut x = tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut page = vec![0u8; PS];
+        for word in page.chunks_exact_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            word.copy_from_slice(&x.to_le_bytes());
+        }
+        page[16..18].copy_from_slice(&(PS as u16).to_be_bytes());
+        page[100..108].copy_from_slice(&tag.to_le_bytes());
+        page
+    }
+
+    fn put(store: &mut PageStore<CrashIo>, pgno: u64, tag: u64) {
+        store.write((pgno - 1) * PS as u64, &page(tag)).unwrap();
+    }
+
+    /// Every page, or an error. Reading anything that isn't one of `page()`'s is reported as such.
+    fn contents<B: BlockIo>(store: &mut PageStore<B>) -> Result<Vec<u64>> {
+        let pages = store.logical_size()? / PS as u64;
+        let mut out = Vec::new();
+        for pgno in 1..=pages {
+            let mut buf = vec![0u8; PS];
+            store.read((pgno - 1) * PS as u64, &mut buf)?;
+            let tag = u64::from_le_bytes(buf[100..108].try_into().unwrap());
+            assert!(buf == page(tag), "page {pgno} holds garbage");
+            out.push(tag);
+        }
+        Ok(out)
+    }
+
+    fn reopened(file: &[u8]) -> Vec<u64> {
+        let io = CrashIo::from_file(file.to_vec());
+        let mut store = PageStore::open(io, Config::default(), true).expect("unopenable");
+        contents(&mut store).expect("unreadable")
+    }
+
+    /// Runs `change` on a database of `old` pages and checks every crash along the way.
+    fn check_crashes(
+        old_pages: u64,
+        lock: Option<&crate::lock::CompactLock>,
+        change: impl Fn(&mut PageStore<CrashIo>, Option<&crate::lock::CompactLock>),
+    ) {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        // Leaves live pages at the start of the file in an order that packing them will change.
+        for pgno in (1..=old_pages).filter(|pgno| !(2..=20).contains(pgno)) {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        for pgno in 2..=20 {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        let old_state = contents(&mut store).unwrap();
+
+        io.0.borrow_mut().record = true;
+        change(&mut store, lock);
+        let new_state = contents(&mut store).unwrap();
+        let crashes = std::mem::take(&mut io.0.borrow_mut().crashes);
+        assert!(!crashes.is_empty());
+        for file in &crashes {
+            let got = reopened(file);
+            assert!(
+                got == old_state || got == new_state,
+                "crash left {} pages",
+                got.len()
+            );
+        }
+        assert_eq!(reopened(&io.0.borrow().current), new_state);
+    }
+
+    #[test]
+    fn crash_during_any_flush_leaves_the_old_or_new_state() {
+        for sync in [true, false] {
+            check_crashes(600, None, |store, _| {
+                put(store, 5, 77);
+                store.flush(sync).unwrap();
+            });
+        }
+        // Several in a row replace both superblock slots, as partial checkpoints do.
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=600 {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        let mut states = vec![contents(&mut store).unwrap()];
+        io.0.borrow_mut().record = true;
+        for round in 1..=3 {
+            put(&mut store, 5, round * 1000);
+            put(&mut store, 600 + round, round * 1000 + 1);
+            store.flush(false).unwrap();
+            states.push(contents(&mut store).unwrap());
+        }
+        for file in &io.0.borrow().crashes {
+            assert!(states.contains(&reopened(file)));
+        }
+    }
+
+    #[test]
+    fn crash_during_truncate_or_live_compaction_leaves_an_intact_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        std::fs::write(&path, b"").unwrap();
+        let lock = crate::lock::CompactLock::open(&path).unwrap();
+        for new_pages in [0u64, 1, 40, 513] {
+            for lock in [None, Some(&lock)] {
+                check_crashes(1600, lock, |store, lock| {
+                    let before = store.superblock().unwrap().compact_id;
+                    store.truncate(new_pages * PS as u64, lock).unwrap();
+                    let compacted = store.superblock().unwrap().compact_id != before;
+                    assert_eq!(compacted, lock.is_some());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn io_errors_during_live_compaction_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        std::fs::write(&path, b"").unwrap();
+        let lock = crate::lock::CompactLock::open(&path).unwrap();
+        let base = {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for round in 1..=2 {
+                for pgno in 1..=600u64 {
+                    put(&mut store, pgno, round * 10_000 + pgno);
+                }
+                store.flush(true).unwrap();
+            }
+            io.0.borrow().current.clone()
+        };
+        let want: Vec<u64> = (1..=40).map(|pgno| 20_000 + pgno).collect();
+        let run = |inject: &dyn Fn(&CrashIo, &PageStore<CrashIo>)| {
+            let io = CrashIo::from_file(base.clone());
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            let mut reader = PageStore::open(io.clone(), Config::default(), true).unwrap();
+            contents(&mut reader).unwrap();
+            inject(&io, &store);
+            let _ = store.truncate(40 * PS as u64, Some(&lock));
+            {
+                let mut s = io.0.borrow_mut();
+                (s.fail_write, s.fail_sync, s.fail_truncate) = (None, false, false);
+            }
+            // The next writer, whoever it is, builds on whatever was published.
+            store.discard_staged();
+            store.refresh().unwrap();
+            store.truncate(40 * PS as u64, Some(&lock)).unwrap();
+            put(&mut store, 41, 555);
+            store.flush(true).unwrap();
+            let mut want = want.clone();
+            want.push(555);
+            assert_eq!(contents(&mut store).unwrap(), want);
+            reader.refresh().unwrap();
+            assert_eq!(contents(&mut reader).unwrap(), want);
+            assert_eq!(reopened(&io.0.borrow().current), want);
+        };
+        run(&|io, _| io.0.borrow_mut().fail_truncate = true);
+        run(&|io, _| io.0.borrow_mut().fail_sync = true);
+        for slot in [0, 4096, SUPERBLOCK_REGION] {
+            for written in [false, true] {
+                run(&|io, _| io.0.borrow_mut().fail_write = Some((slot, written)));
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_failed_superblock_write_is_seen_by_readers_that_saw_the_first() {
+        for written in [false, true] {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for pgno in 1..=600 {
+                put(&mut store, pgno, pgno);
+            }
+            store.flush(true).unwrap();
+            let mut reader = PageStore::open(io.clone(), Config::default(), true).unwrap();
+
+            let slot = io.next_slot(&store);
+            io.0.borrow_mut().fail_write = Some((slot, written));
+            put(&mut store, 7, 1007);
+            assert!(store.flush(true).is_err());
+            // Knows about the superblock, but has read nothing that it points to yet.
+            reader.refresh().unwrap();
+
+            // The retry adds something the first attempt didn't have.
+            io.0.borrow_mut().fail_write = None;
+            put(&mut store, 8, 1008);
+            store.flush(true).unwrap();
+            let seen = contents(&mut reader).unwrap();
+            assert_eq!(seen[6], if written { 1007 } else { 7 });
+            assert_eq!(seen[7], 8);
+            reader.refresh().unwrap();
+            let now = contents(&mut reader).unwrap();
+            assert_eq!((now[6], now[7]), (1007, 1008));
+        }
+    }
+
+    #[test]
+    fn sync_failure_after_publishing_keeps_memory_and_disk_in_step() {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        put(&mut store, 1, 1);
+        store.flush(true).unwrap();
+        put(&mut store, 1, 2);
+        store.flush(false).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(store.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        let published = store.superblock().unwrap().generation;
+        put(&mut store, 1, 3);
+        store.flush(true).unwrap();
+        assert!(store.superblock().unwrap().generation > published);
+        assert_eq!(reopened(&io.0.borrow().current), [3]);
+    }
+
+    #[test]
+    fn failed_truncate_does_not_lose_pages() {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=600 {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        let slot = io.next_slot(&store);
+        io.0.borrow_mut().fail_write = Some((slot, false));
+        assert!(store.truncate(550 * PS as u64, None).is_err());
+        io.0.borrow_mut().fail_write = None;
+        put(&mut store, 590, 9590);
+        store.flush(true).unwrap();
+        let mut want: Vec<u64> = (1..=600).collect();
+        want[589] = 9590;
+        assert_eq!(contents(&mut store).unwrap(), want);
+        assert_eq!(reopened(&io.0.borrow().current), want);
+    }
+
+    #[test]
+    fn discarded_changes_never_overwrite_another_writers() {
+        let io = CrashIo::default();
+        let config = Config {
+            cache_mib: 64,
+            ..Config::default()
+        };
+        let mut a = PageStore::open(io.clone(), config, false).unwrap();
+        for pgno in 1..=100 {
+            put(&mut a, pgno, pgno);
+        }
+        a.flush(true).unwrap();
+        let mut b = PageStore::open(io.clone(), Config::default(), false).unwrap();
+
+        // Enough to spill, and to be cached under offsets that b will use.
+        for pgno in 1..=4200 {
+            put(&mut a, pgno, 50_000 + pgno);
+        }
+        contents(&mut a).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(a.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        a.discard_staged();
+
+        for pgno in 1..=200 {
+            put(&mut b, pgno, 90_000 + pgno);
+        }
+        b.flush(true).unwrap();
+        a.flush(true).unwrap();
+        a.refresh().unwrap();
+        let want: Vec<u64> = (1..=200).map(|pgno| 90_000 + pgno).collect();
+        assert_eq!(contents(&mut a).unwrap(), want);
+        assert_eq!(reopened(&io.0.borrow().current), want);
+    }
+
+    #[test]
+    fn database_can_start_with_any_page() {
+        for ps in [512usize, 4096, 65536] {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io, Config::default(), false).unwrap();
+            store.write(3 * ps as u64, &vec![4u8; ps]).unwrap();
+            let mut p1 = vec![1u8; ps];
+            p1[16..18].copy_from_slice(&if ps == 65536 { 1u16 } else { ps as u16 }.to_be_bytes());
+            store.write(0, &p1).unwrap();
+            store.flush(true).unwrap();
+            assert_eq!(store.logical_size().unwrap(), 4 * ps as u64);
+            let mut buf = vec![0u8; ps];
+            store.read(0, &mut buf).unwrap();
+            assert_eq!(buf, p1);
+            store.read(3 * ps as u64, &mut buf).unwrap();
+            assert_eq!(buf, vec![4u8; ps]);
+        }
+    }
+
+    #[test]
+    fn page_size_changes_keep_every_byte() {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io, Config::default(), false).unwrap();
+        let mut model = vec![0u8; 64 * 16384];
+        let mut x = 1u64;
+        for (i, &ps) in [16384usize, 512, 65536, 4096, 16384].iter().enumerate() {
+            for _ in 0..200 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let at = (x as usize % (model.len() / ps)) * ps;
+                let fill = vec![(x >> 32) as u8 ^ i as u8; ps];
+                store.write(at as u64, &fill).unwrap();
+                model[at..at + ps].copy_from_slice(&fill);
+            }
+            store.flush(true).unwrap();
+            let len = store.logical_size().unwrap() as usize;
+            let mut got = vec![0u8; len];
+            store.read(0, &mut got).unwrap();
+            assert!(got == model[..len], "after {ps}-byte pages");
+        }
+        // Sizes that aren't whole store pages are rounded up.
+        store.truncate(5 * 16384 + 512, None).unwrap();
+        assert_eq!(store.logical_size().unwrap(), 6 * 16384);
+    }
+
+    #[test]
+    fn superblock_caught_mid_write_is_read_again() {
+        /// Shows a half-written newer slot for the first few reads.
+        struct TearingIo(CrashIo, u32);
+        impl BlockIo for TearingIo {
+            fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                let n = self.0.read_at(offset, buf)?;
+                if offset == 0 && self.1 > 0 {
+                    self.1 -= 1;
+                    let region: &[u8] = buf;
+                    let newest = Superblock::select_latest(region.try_into().unwrap()).unwrap();
+                    buf[newest.slot_offset() as usize + 4090] ^= 0xff;
+                }
+                Ok(n)
+            }
+            fn write_at(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn sync(&mut self) -> Result<()> {
+                unreachable!()
+            }
+            fn file_size(&mut self) -> Result<u64> {
+                self.0.file_size()
+            }
+            fn truncate(&mut self, _: u64) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for tag in 1..=2 {
+            put(&mut store, 1, tag);
+            store.flush(true).unwrap();
+        }
+        let mut reader = PageStore::open(TearingIo(io.clone(), 2), Config::default(), true).unwrap();
+        assert_eq!(contents(&mut reader).unwrap(), [2]);
+        // A slot that stays torn is what a crash leaves: the other one counts.
+        let mut reader = PageStore::open(TearingIo(io, 1000), Config::default(), true).unwrap();
+        assert_eq!(contents(&mut reader).unwrap(), [1]);
+    }
+
+    #[test]
+    fn only_an_empty_or_zeroed_header_counts_as_a_new_database() {
+        for len in [0usize, 100, 4096, 8192] {
+            let mut store =
+                PageStore::open(CrashIo::from_file(vec![0; len]), Config::default(), false).unwrap();
+            assert_eq!(store.logical_size().unwrap(), 0);
+            put(&mut store, 1, 5);
+            store.flush(true).unwrap();
+            assert_eq!(contents(&mut store).unwrap(), [5]);
+        }
+        // Zeros over a file with content are damage.
+        assert!(matches!(
+            PageStore::open(CrashIo::from_file(vec![0; 8208]), Config::default(), false),
+            Err(Error::NotASqmicroDb)
+        ));
+    }
+
+    #[test]
+    fn crafted_superblocks_are_rejected_without_huge_allocations() {
+        let mut good = Superblock::empty();
+        good.generation = 2;
+        good.page_size = 4096;
+        good.page_count = 600;
+        good.l1_entries = 2;
+        good.l1_offset = SUPERBLOCK_REGION;
+        good.tail_offset = SUPERBLOCK_REGION + 16;
+        assert!(Superblock::decode(&good.encode()).is_some());
+        let bad: [fn(&mut Superblock); 8] = [
+            |sb| sb.l1_entries = u32::MAX,
+            |sb| sb.page_count = 1 << 40,
+            |sb| sb.page_count = u64::MAX,
+            |sb| sb.page_size = 0,
+            |sb| sb.generation = u64::MAX,
+            |sb| sb.compact_id = u64::MAX,
+            |sb| sb.tail_offset = u64::MAX - 15,
+            |sb| sb.l1_offset = u64::MAX,
+        ];
+        for change in bad {
+            let mut sb = good.clone();
+            change(&mut sb);
+            assert!(Superblock::decode(&sb.encode()).is_none());
+        }
+        // Consistent, but the file is far too small for its directory.
+        let mut sb = good;
+        sb.l1_entries = u32::MAX;
+        sb.page_count = u32::MAX as u64 * L2_ENTRIES as u64;
+        sb.tail_offset = SUPERBLOCK_REGION + (1 << 36);
+        let mut file = vec![0u8; 8192];
+        file[..4096].copy_from_slice(&sb.encode());
+        assert!(matches!(
+            PageStore::open(CrashIo::from_file(file), Config::default(), true),
+            Err(Error::Corrupt(_))
+        ));
     }
 }
