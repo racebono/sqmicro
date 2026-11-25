@@ -6,8 +6,8 @@ use crate::codec::{ChunkInput, Decompressor, EncodedChunk, compress_chunks_paral
 use crate::error::{Error, Result};
 use crate::format::{
     CHUNK_HEADER_SIZE, ChunkHeader, DirEntry, L2_ENTRIES, L2_PAGE_SIZE, L2Page, MAX_CHUNK_BYTES,
-    MAX_CHUNK_PAGES, SUPERBLOCK_REGION, Superblock, align16, alloc_offset, is_valid_page_size,
-    parse_sqlite_page_size,
+    MAX_CHUNK_PAGES, SUPERBLOCK_REGION, SUPERBLOCK_SIZE, Superblock, align16, alloc_offset,
+    is_valid_page_size, parse_sqlite_page_size,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -122,11 +122,15 @@ pub struct PageStore<B: BlockIo> {
     pending_writes: BTreeMap<u64, Vec<u8>>,
     pending_bytes: usize,
     dirty_l2: HashMap<u32, L2Page>,
+    /// `dirty_l2` has changes to publish, for spilled pages or a truncation.
     has_unflushed_spills: bool,
     /// Consecutive superblock writes that failed, and so may or may not have reached the file.
     failed_publishes: u64,
-    /// The current superblock was read from the file, so it may not be durable yet.
+    /// The current superblock may not be on the disk: it was read from the file, or a sync failed
+    /// after it was written.
     base_unsynced: bool,
+    /// A sync failed after pages were spilled, so they may never reach the disk.
+    spills_unsure: bool,
 
     /// The superblock must be checked before the next read.
     stale: bool,
@@ -147,6 +151,7 @@ impl<B: BlockIo> PageStore<B> {
             config,
             read_only,
             base_unsynced: superblock.is_some(),
+            spills_unsure: false,
             superblock,
             l1,
             l2_cache: LruCache::new(L2_CACHE_MAX_BYTES),
@@ -187,6 +192,7 @@ impl<B: BlockIo> PageStore<B> {
         self.dirty_l2.clear();
         self.staged_header = None;
         self.has_unflushed_spills = false;
+        self.spills_unsure = false;
         // Spilled chunks may be cached under offsets that the next writer will use.
         self.chunk_cache.clear();
         self.reset_staged();
@@ -279,6 +285,7 @@ impl<B: BlockIo> PageStore<B> {
             if let Some(sb) = &self.superblock
                 && sb.header_len == 100
                 && sb.page_count >= 1
+                && self.current_geometry().1 >= 1
             {
                 buf.copy_from_slice(&sb.sqlite_header[offset as usize..end as usize]);
                 return Ok(ReadOutcome::Full);
@@ -417,15 +424,25 @@ impl<B: BlockIo> PageStore<B> {
         }
         if !self.has_pending_writes() {
             if sync_disk {
-                self.io.sync()?;
+                self.sync()?;
             }
             return Ok(());
+        }
+        if self.spills_unsure {
+            return Err(Error::Io(std::io::Error::other(
+                "a sync failed since these pages were written",
+            )));
         }
 
         self.spill_pending_chunks()?;
 
-        let page_size = self.staged_page_size;
         let page_count = self.staged_page_count;
+        // An empty database can start again with any page size.
+        let page_size = if page_count == 0 {
+            0
+        } else {
+            self.staged_page_size
+        };
         let l1_entries = if page_count == 0 {
             0usize
         } else {
@@ -459,7 +476,9 @@ impl<B: BlockIo> PageStore<B> {
         let (l1_offset, tail) = self.write_l1(&new_l1, tail)?;
 
         let prev_compact = self.superblock.as_ref().map_or(0, |sb| sb.compact_id);
-        let (header_len, sqlite_header) = if let Some(hdr) = self.staged_header {
+        let (header_len, sqlite_header) = if page_count == 0 {
+            (0, [0u8; 100])
+        } else if let Some(hdr) = self.staged_header {
             (100, hdr)
         } else if let Some(sb) = &self.superblock {
             (sb.header_len, sb.sqlite_header)
@@ -496,14 +515,19 @@ impl<B: BlockIo> PageStore<B> {
                 self.l2_cache.insert(l2_idx, page, L2_PAGE_SIZE);
             }
         }
+        // A staged truncation can drop whole L2 pages.
+        for idx in l1_entries..self.l1.len() {
+            self.l2_cache.remove(&(idx as u32));
+        }
         self.staged_header = None;
         self.l1 = new_l1;
         self.has_unflushed_spills = false;
+        self.spills_unsure = false;
 
         // Other connections can see the new superblock, so if this fails the in-memory commit above
         // still stands.
         if sync_disk {
-            self.io.sync()?;
+            self.sync()?;
         }
         Ok(())
     }
@@ -529,7 +553,7 @@ impl<B: BlockIo> PageStore<B> {
     fn publish(&mut self, mut sb: Superblock) -> Result<()> {
         let prev_gen = self.superblock.as_ref().map_or(0, |sb| sb.generation);
         sb.generation = prev_gen + 1 + 2 * self.failed_publishes;
-        self.io.sync()?;
+        self.sync()?;
         self.staged_tail_offset = sb.tail_offset;
         if let Err(e) = self.io.write_at(sb.slot_offset(), &sb.encode()) {
             // Other connections may already see this superblock. A retry must leave the space it
@@ -542,15 +566,37 @@ impl<B: BlockIo> PageStore<B> {
         Ok(())
     }
 
-    /// Must run before anything is written past the tail of a superblock that was read from the file.
-    /// If that superblock ends a compaction that was cut short, its tail is lower than that of the
+    /// Must run before anything is written past the tail of the current superblock, if that may not
+    /// be on the disk. If it ends a compaction that was cut short, its tail is lower than that of the
     /// superblock a crash would fall back to, whose data is then still needed.
     fn sync_base(&mut self) -> Result<()> {
         if self.base_unsynced {
-            self.io.sync()?;
-            self.base_unsynced = false;
+            self.sync()?;
         }
         Ok(())
+    }
+
+    /// Syncs the file. After a failed sync, data may never reach the disk unless it is written
+    /// again, so the current superblock is written again first if it may not be there. Everything
+    /// it points to was synced before it was written, and the bytes are the same, so readers can't
+    /// catch it half written.
+    fn sync(&mut self) -> Result<()> {
+        if self.base_unsynced
+            && let Some(sb) = &self.superblock
+        {
+            let encoded = sb.encode();
+            let mut slot = [0u8; SUPERBLOCK_SIZE];
+            // Unless another process has written that slot since.
+            if self.io.read_at(sb.slot_offset(), &mut slot)? == SUPERBLOCK_SIZE && slot == encoded {
+                self.io.write_at(sb.slot_offset(), &encoded)?;
+            }
+        }
+        let res = self.io.sync();
+        self.base_unsynced = res.is_err();
+        if res.is_err() && self.has_unflushed_spills {
+            self.spills_unsure = true;
+        }
+        res
     }
 
     pub fn has_pending_writes(&self) -> bool {
@@ -567,12 +613,12 @@ impl<B: BlockIo> PageStore<B> {
                 "cannot truncate a read-only sqmicro database".into(),
             ));
         }
-        if !self.has_pending_writes() {
-            self.refresh()?;
-        }
+        // A rollback-mode transaction truncates before its pages are flushed, and so does the
+        // rollback of one. Neither may be published yet: the journal may be gone if it fails.
         if self.has_pending_writes() {
-            self.flush(false)?;
+            return self.truncate_staged(new_size);
         }
+        self.refresh()?;
 
         let (page_size, old_page_count) = self.current_geometry();
         if page_size == 0 {
@@ -590,53 +636,16 @@ impl<B: BlockIo> PageStore<B> {
             return Ok(());
         }
 
-        let new_l1_entries = if new_page_count == 0 {
-            0usize
-        } else {
-            ((new_page_count - 1) / L2_ENTRIES as u64 + 1) as usize
-        };
-
-        // Compute exact live bytes for pages 1..=new_page_count.
-        let mut unique_chunks = std::collections::HashSet::<u64>::new();
-        let mut live_chunk_bytes = 0u64;
+        let new_l1_entries = new_page_count.div_ceil(L2_ENTRIES as u64) as usize;
         let mut trimmed_last_l2: Option<(u32, L2Page)> = None;
-        for l2_idx in 0..new_l1_entries {
-            let mut l2 = self.load_committed_l2(l2_idx as u32)?;
-            let is_last = l2_idx + 1 == new_l1_entries;
-            let keep_slots = if is_last {
-                let rem = (new_page_count % L2_ENTRIES as u64) as usize;
-                if rem == 0 { L2_ENTRIES } else { rem }
-            } else {
-                L2_ENTRIES
-            };
-            if is_last && keep_slots < L2_ENTRIES {
-                for slot in keep_slots..L2_ENTRIES {
-                    l2.entries[slot] = DirEntry::EMPTY;
-                }
-                trimmed_last_l2 = Some((l2_idx as u32, l2.clone()));
-            }
-            for slot in 0..keep_slots {
-                let entry = l2.entries[slot];
-                if !entry.is_empty() && unique_chunks.insert(entry.chunk_offset()) {
-                    live_chunk_bytes = live_chunk_bytes.saturating_add(entry.read_len() as u64);
-                }
-            }
+        let rem = (new_page_count % L2_ENTRIES as u64) as usize;
+        if rem != 0 {
+            let l2_idx = new_l1_entries as u32 - 1;
+            let mut l2 = self.load_committed_l2(l2_idx)?;
+            l2.entries[rem..].fill(DirEntry::EMPTY);
+            trimmed_last_l2 = Some((l2_idx, l2));
         }
-        let exact_live_bytes = live_chunk_bytes
-            .saturating_add((new_l1_entries as u64).saturating_mul(L2_PAGE_SIZE as u64))
-            .saturating_add(align16((new_l1_entries as u64) * 8));
-
-        let physical_data = self.staged_tail_offset.saturating_sub(SUPERBLOCK_REGION);
-        let dead_bytes = physical_data.saturating_sub(exact_live_bytes);
-
-        let live_uncompressed_bytes = new_page_count.saturating_mul(ps_u64);
-        let should_live_compact = (new_page_count == 0 && physical_data > 0)
-            || (self.config.compact_threshold > 0
-                && exact_live_bytes <= LIVE_COMPACT_MAX_BYTES
-                && live_uncompressed_bytes <= LIVE_COMPACT_MAX_LOGICAL_BYTES
-                && dead_bytes >= 4 * 1024 * 1024
-                && dead_bytes.saturating_mul(100)
-                    >= physical_data.saturating_mul(self.config.compact_threshold as u64));
+        let live_bytes = self.live_bytes(new_page_count, trimmed_last_l2.as_ref())?;
 
         // Logical truncate (safe with concurrent readers; no live bytes overwritten).
         self.sync_base()?;
@@ -671,7 +680,7 @@ impl<B: BlockIo> PageStore<B> {
             chunk_max_pages: self.chunk_pages_limit(effective_page_size) as u32,
             page_count: new_page_count,
             tail_offset: tail,
-            live_bytes: exact_live_bytes.min(tail.saturating_sub(SUPERBLOCK_REGION)),
+            live_bytes: live_bytes.min(tail.saturating_sub(SUPERBLOCK_REGION)),
             l1_offset,
             l1_entries: new_l1_entries as u32,
             header_len,
@@ -691,15 +700,90 @@ impl<B: BlockIo> PageStore<B> {
         }
         self.l1 = new_l1;
 
-        // The truncation is done. Reclaiming the space is best effort: if it fails, whatever was
-        // published last still describes intact data.
-        if should_live_compact
-            && let Some(lock) = compact_lock
-            && self.live_compact(lock).is_err()
-        {
+        self.compact_if_worthwhile(compact_lock);
+        Ok(())
+    }
+
+    /// Truncates what is staged, for the next flush to publish.
+    fn truncate_staged(&mut self, new_size: u64) -> Result<()> {
+        let ps = self.staged_page_size as u64;
+        if ps == 0 {
+            return Ok(());
+        }
+        let new_page_count = new_size.div_ceil(ps);
+        if new_page_count >= self.staged_page_count {
+            return Ok(());
+        }
+        let dropped = self.pending_writes.split_off(&(new_page_count + 1));
+        self.pending_bytes -= dropped.len() * ps as usize;
+        // Should the database grow again before the flush, the pages that were there are gone.
+        let kept_l2 = new_page_count.div_ceil(L2_ENTRIES as u64) as u32;
+        let staged_l2 = self.staged_page_count.div_ceil(L2_ENTRIES as u64) as u32;
+        for idx in kept_l2..staged_l2.max(self.l1.len() as u32) {
+            self.dirty_l2.insert(idx, L2Page::empty());
+        }
+        let rem = (new_page_count % L2_ENTRIES as u64) as usize;
+        if rem != 0 {
+            let idx = kept_l2 - 1;
+            if !self.dirty_l2.contains_key(&idx) {
+                let base = self.load_committed_l2(idx)?;
+                self.dirty_l2.insert(idx, base);
+            }
+            self.dirty_l2.get_mut(&idx).unwrap().entries[rem..].fill(DirEntry::EMPTY);
+        }
+        self.staged_page_count = new_page_count;
+        if new_page_count == 0 {
+            self.staged_header = None;
+        }
+        self.has_unflushed_spills = true;
+        Ok(())
+    }
+
+    /// Bytes that pages `1..=page_count` and their directory take up, counting `last_l2` instead of
+    /// the committed L2 page with the same index.
+    fn live_bytes(&mut self, page_count: u64, last_l2: Option<&(u32, L2Page)>) -> Result<u64> {
+        let l1_entries = page_count.div_ceil(L2_ENTRIES as u64);
+        let mut chunks = std::collections::HashSet::<u64>::new();
+        let mut bytes = 0u64;
+        for l2_idx in 0..l1_entries as u32 {
+            let l2 = match last_l2 {
+                Some((idx, l2)) if *idx == l2_idx => l2.clone(),
+                _ => self.load_committed_l2(l2_idx)?,
+            };
+            for entry in l2.entries {
+                if !entry.is_empty() && chunks.insert(entry.chunk_offset()) {
+                    bytes = bytes.saturating_add(entry.read_len() as u64);
+                }
+            }
+        }
+        Ok(bytes
+            .saturating_add(l1_entries.saturating_mul(L2_PAGE_SIZE as u64))
+            .saturating_add(align16(l1_entries * 8)))
+    }
+
+    /// Compacts the database in place if that is cheap and reclaims enough. Best effort: if it
+    /// fails, whatever was published last describes intact data.
+    fn compact_if_worthwhile(&mut self, lock: Option<&crate::lock::CompactLock>) {
+        let Some(lock) = lock else {
+            return;
+        };
+        let worthwhile = self.live_bytes(self.staged_page_count, None).map(|live| {
+            let physical = self.staged_tail_offset.saturating_sub(SUPERBLOCK_REGION);
+            let dead = physical.saturating_sub(live);
+            let logical = self
+                .staged_page_count
+                .saturating_mul(self.staged_page_size as u64);
+            (self.staged_page_count == 0 && physical > 0)
+                || (self.config.compact_threshold > 0
+                    && live <= LIVE_COMPACT_MAX_BYTES
+                    && logical <= LIVE_COMPACT_MAX_LOGICAL_BYTES
+                    && dead >= 4 * 1024 * 1024
+                    && dead.saturating_mul(100)
+                        >= physical.saturating_mul(self.config.compact_threshold as u64))
+        });
+        if worthwhile.unwrap_or(false) && self.live_compact(lock).is_err() {
             self.discard_staged();
         }
-        Ok(())
     }
 
     /// Rewrites the database at the start of the file and cuts off the rest.
@@ -744,12 +828,12 @@ impl<B: BlockIo> PageStore<B> {
 
         let (sb, l1) = self.write_copy(&chunks, old_tail)?;
         self.publish_copy(sb, l1)?;
-        self.io.sync()?; // the copy must be what a crash falls back to before its source goes
+        self.sync()?; // the copy must be what a crash falls back to before its source goes
 
         let (mut sb, l1) = self.write_copy(&chunks, SUPERBLOCK_REGION)?;
         sb.compact_id += 1; // offsets are reused, so readers must drop their caches
         self.publish_copy(sb, l1)?;
-        self.io.sync()?;
+        self.sync()?;
 
         let _ = self.io.truncate(self.staged_tail_offset);
         Ok(())
@@ -843,9 +927,8 @@ impl<B: BlockIo> PageStore<B> {
         if self.superblock.is_none() {
             let init_sb = Superblock::initial();
             self.io.write_at(init_sb.slot_offset(), &init_sb.encode())?;
-            self.io.sync()?;
+            self.sync()?;
             self.superblock = Some(init_sb);
-            self.base_unsynced = false;
         }
         self.sync_base()?;
 
@@ -1276,6 +1359,32 @@ mod tests {
             ));
             assert_eq!(&out[..8], &pgno.to_le_bytes());
         }
+
+        // 16 pages to a chunk, and page 1 alone, uncompressed although it is mostly zeros.
+        let entries: Vec<DirEntry> = (1..=21)
+            .map(|pgno| reader.lookup_dir_entry(pgno).unwrap())
+            .collect();
+        let chunk = |e: &DirEntry| e.chunk_offset();
+        assert!(entries[1..].iter().all(|e| chunk(e) != chunk(&entries[0])));
+        assert!(entries[0].read_len() >= page_size);
+        assert!(
+            entries[1..17]
+                .iter()
+                .all(|e| chunk(e) == chunk(&entries[1]))
+        );
+        assert!(
+            entries[17..]
+                .iter()
+                .all(|e| chunk(e) == chunk(&entries[17]))
+        );
+        assert_ne!(chunk(&entries[1]), chunk(&entries[17]));
+
+        // The header comes from the superblock, without reading page 1.
+        let at = entries[0].chunk_offset() as usize;
+        mem.0.borrow_mut()[at..at + entries[0].read_len()].fill(0xff);
+        let mut reader = PageStore::open(mem, Config::default(), true).unwrap();
+        reader.read(24, &mut change_cnt).unwrap();
+        assert_eq!(u32::from_be_bytes(change_cnt), 42);
     }
 
     #[test]
@@ -1307,6 +1416,8 @@ mod tests {
             page[..8].copy_from_slice(&pgno.to_le_bytes());
             writer.write((pgno - 1) * page_size as u64, &page).unwrap();
         }
+        assert!(writer.has_unflushed_spills);
+        assert!(writer.pending_bytes <= PENDING_SPILL_CAP_BYTES);
         writer.flush(true).unwrap();
         let mut out = vec![0u8; page_size];
         writer.read(500 * page_size as u64, &mut out).unwrap();
@@ -1357,6 +1468,7 @@ mod tests {
 
         let new_p2 = vec![0xABu8; page_size];
         writer.write(page_size as u64, &new_p2).unwrap();
+        writer.flush(false).unwrap();
         writer.truncate(2 * page_size as u64, Some(&lock)).unwrap();
 
         let small_size = std::fs::metadata(&path).unwrap().len();
@@ -1437,74 +1549,6 @@ mod tests {
         assert_eq!(reader.logical_size().unwrap(), 0);
         let mut fresh_reader = PageStore::open(mem.clone(), Config::default(), true).unwrap();
         assert_eq!(fresh_reader.logical_size().unwrap(), 0);
-    }
-
-    #[test]
-    fn failed_flush_preserves_dirty_state_for_successful_retry() {
-        #[derive(Clone)]
-        struct FaultyIo {
-            inner: MemBlockIo,
-            fail_sync: Rc<RefCell<bool>>,
-        }
-        impl BlockIo for FaultyIo {
-            fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-                self.inner.read_at(offset, buf)
-            }
-            fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
-                self.inner.write_at(offset, buf)
-            }
-            fn sync(&mut self) -> Result<()> {
-                if *self.fail_sync.borrow() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected sync fault",
-                    )
-                    .into());
-                }
-                Ok(())
-            }
-            fn file_size(&mut self) -> Result<u64> {
-                self.inner.file_size()
-            }
-            fn truncate(&mut self, size: u64) -> Result<()> {
-                self.inner.truncate(size)
-            }
-        }
-
-        let inner = MemBlockIo::shared();
-        let fail_sync = Rc::new(RefCell::new(false));
-        let io = FaultyIo {
-            inner: inner.clone(),
-            fail_sync: fail_sync.clone(),
-        };
-        let mut writer = PageStore::open(io, Config::default(), false).unwrap();
-        let page_size = 4096usize;
-        let mut p1 = vec![0u8; page_size];
-        p1[..16].copy_from_slice(b"SQLite format 3\0");
-        p1[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
-        writer.write(0, &p1).unwrap();
-        writer.flush(true).unwrap();
-        p1[24..28].copy_from_slice(&99u32.to_be_bytes());
-        writer.write(0, &p1).unwrap();
-        writer
-            .write(page_size as u64, &vec![0x77u8; page_size])
-            .unwrap();
-
-        // This flush fails on sync, with everything but the superblock written.
-        *fail_sync.borrow_mut() = true;
-        assert!(writer.flush(true).is_err());
-        // Clear fault and retry: all dirty L2 pages and header must still publish cleanly!
-        *fail_sync.borrow_mut() = false;
-        writer.flush(true).unwrap();
-
-        let mut reader = PageStore::open(inner, Config::default(), true).unwrap();
-        assert_eq!(reader.logical_size().unwrap(), 2 * page_size as u64);
-        let mut hdr = [0u8; 4];
-        reader.read(24, &mut hdr).unwrap();
-        assert_eq!(u32::from_be_bytes(hdr), 99);
-        let mut p2 = vec![0u8; page_size];
-        reader.read(page_size as u64, &mut p2).unwrap();
-        assert_eq!(p2, vec![0x77u8; page_size]);
     }
 
     #[test]
@@ -1674,11 +1718,15 @@ mod tests {
         }
         fn sync(&mut self) -> Result<()> {
             let mut s = self.0.borrow_mut();
+            // A failed sync may lose the writes for good, even if a later one succeeds.
             if s.fail_sync || s.next_op_fails().is_some() {
+                s.unsynced.clear();
                 return Err(injected());
             }
-            s.durable = s.current.clone();
-            s.unsynced.clear();
+            let ops = std::mem::take(&mut s.unsynced);
+            for op in &ops {
+                op.apply(&mut s.durable);
+            }
             Ok(())
         }
         fn file_size(&mut self) -> Result<u64> {
@@ -1935,6 +1983,68 @@ mod tests {
     }
 
     #[test]
+    fn pages_written_before_a_failed_sync_are_never_published() {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        for pgno in 1..=40 {
+            put(&mut store, pgno, 100 + pgno);
+        }
+        io.0.borrow_mut().fail_sync = true;
+        assert!(store.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        // Their chunks may be gone, so there is no retry.
+        assert!(store.flush(true).is_err());
+        let old: Vec<u64> = (1..=40).collect();
+        assert_eq!(reopened(&io.0.borrow().durable), old);
+
+        // What SQLite does next: roll back, then write the pages again.
+        store.discard_staged();
+        for pgno in 1..=40 {
+            put(&mut store, pgno, 200 + pgno);
+        }
+        store.flush(true).unwrap();
+        let new: Vec<u64> = (201..=240).collect();
+        assert_eq!(contents(&mut store).unwrap(), new);
+        assert_eq!(reopened(&io.0.borrow().durable), new);
+    }
+
+    #[test]
+    fn superblock_lost_by_a_failed_sync_is_written_again() {
+        for more_pages in [false, true] {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for pgno in 1..=40 {
+                put(&mut store, pgno, pgno);
+            }
+            store.flush(true).unwrap();
+            for pgno in 1..=40 {
+                put(&mut store, pgno, 100 + pgno);
+            }
+            store.flush(false).unwrap();
+            // Loses the superblock just written.
+            io.0.borrow_mut().fail_sync = true;
+            assert!(store.flush(true).is_err());
+            io.0.borrow_mut().fail_sync = false;
+
+            let mut states = vec![(101..=140).collect::<Vec<u64>>()];
+            io.0.borrow_mut().record = true;
+            if more_pages {
+                put(&mut store, 41, 41);
+                states.push(contents(&mut store).unwrap());
+            }
+            store.flush(true).unwrap();
+            assert_eq!(reopened(&io.0.borrow().durable), *states.last().unwrap());
+            for file in &io.0.borrow().crashes {
+                assert!(states.contains(&reopened(file)));
+            }
+        }
+    }
+
+    #[test]
     fn retry_after_failed_superblock_write_is_seen_by_readers_that_saw_the_first() {
         for written in [false, true] {
             let io = CrashIo::default();
@@ -2037,6 +2147,87 @@ mod tests {
         let want: Vec<u64> = (1..=200).map(|pgno| 90_000 + pgno).collect();
         assert_eq!(contents(&mut a).unwrap(), want);
         assert_eq!(reopened(&io.0.borrow().current), want);
+    }
+
+    #[test]
+    fn truncating_staged_pages_publishes_nothing_until_the_flush() {
+        // Pages left, whether some were spilled, and whether pages come back before the flush.
+        for (new_pages, spill, regrow) in [
+            (550u64, false, false),
+            (550, true, true),
+            (512, false, true),
+            (400, false, false), // none of the staged pages are left
+            (0, false, false),
+            (0, true, true),
+        ] {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for pgno in 1..=600 {
+                put(&mut store, pgno, pgno);
+            }
+            store.flush(true).unwrap();
+            let old = contents(&mut store).unwrap();
+            for pgno in 500..=700 {
+                put(&mut store, pgno, 10_000 + pgno);
+            }
+            if spill {
+                store.spill_pending_chunks().unwrap();
+            }
+            store.truncate(new_pages * PS as u64, None).unwrap();
+            assert_eq!(store.logical_size().unwrap(), new_pages * PS as u64);
+            assert_eq!(reopened(&io.0.borrow().current), old);
+            let mut header = [1u8; 100];
+            let outcome = store.read(0, &mut header).unwrap();
+            if new_pages == 0 {
+                assert!(matches!(outcome, ReadOutcome::ShortRead) && header == [0; 100]);
+            }
+
+            let want: Vec<u64> = (1..=new_pages)
+                .map(|p| if p < 500 { p } else { 10_000 + p })
+                .collect();
+            assert_eq!(contents(&mut store).unwrap(), want);
+            if !regrow {
+                store.flush(true).unwrap();
+                assert_eq!(contents(&mut store).unwrap(), want);
+                assert_eq!(reopened(&io.0.borrow().current), want);
+                if new_pages == 0 {
+                    assert_eq!(store.superblock().unwrap().page_size, 0);
+                }
+            }
+
+            // Pages that come back are empty.
+            put(&mut store, 680, 680);
+            store.flush(true).unwrap();
+            let mut reader = PageStore::open(io.clone(), Config::default(), true).unwrap();
+            let mut buf = vec![0u8; PS];
+            for store in [&mut store, &mut reader] {
+                for pgno in [new_pages + 1, 600, 679] {
+                    store.read((pgno - 1) * PS as u64, &mut buf).unwrap();
+                    assert!(buf.iter().all(|&b| b == 0), "page {pgno}");
+                }
+                for (i, &tag) in want.iter().chain([&680]).enumerate() {
+                    let pgno = if i < want.len() { i as u64 + 1 } else { 680 };
+                    store.read((pgno - 1) * PS as u64, &mut buf).unwrap();
+                    assert!(buf == page(tag), "page {pgno}");
+                }
+            }
+        }
+
+        // Also those in directory pages that only staged pages used.
+        let mut store = PageStore::open(CrashIo::default(), Config::default(), false).unwrap();
+        for pgno in 1..=700 {
+            put(&mut store, pgno, pgno);
+            if pgno == 300 {
+                store.flush(true).unwrap();
+            }
+        }
+        store.spill_pending_chunks().unwrap();
+        store.truncate(100 * PS as u64, None).unwrap();
+        put(&mut store, 680, 680);
+        store.flush(true).unwrap();
+        let mut buf = vec![0u8; PS];
+        store.read(599 * PS as u64, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
     }
 
     #[test]

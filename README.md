@@ -198,7 +198,7 @@ The file has three kinds of content:
 
 Nothing is ever allocated in the 4 KiB at the 1 GiB mark, because SQLite takes mandatory locks there on Windows.
 
-Files start with the bytes `SQMICRO1`, followed by a format version. This release reads and writes **version 2** only. Opening another version, or a plain SQLite database, fails with `SQLITE_NOTADB` and leaves the file unchanged.
+Superblocks start with the bytes `SQMICRO1`, followed by a format version. This release reads and writes **version 2** only. Opening another version, or a plain SQLite database, fails with `SQLITE_NOTADB` and leaves the file unchanged.
 
 ## Limitations
 

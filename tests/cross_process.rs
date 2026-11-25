@@ -144,9 +144,9 @@ fn cross_process_child_writer_entry() {
                     continue;
                 }
                 let lap = (t / 95.0) as i64;
-                // Attach 512B high-entropy blob to 1 in 4 rows in phase 1
+                // Attach 1 KiB high-entropy blob to 1 in 4 rows in phase 1
                 let blob = if tick % 4 == 0 {
-                    next_blob(512)
+                    next_blob(1024)
                 } else {
                     vec![(car as u8).wrapping_add(batch as u8); 64]
                 };
@@ -192,6 +192,14 @@ fn cross_process_child_writer_entry() {
     }
 
     // Mid-run Bono `clear_tables` sequence: DELETE all tables + new epoch + VACUUM + wal_checkpoint(TRUNCATE).
+    // The readers pause, keeping their connections, so that the database is compacted under them.
+    std::fs::write(cleared_path.with_file_name("clearing"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !cleared_path.with_file_name("paused").exists() {
+        assert!(Instant::now() < deadline, "readers never paused");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let before_clear = std::fs::metadata(&db_path).unwrap().len();
     {
         let tx = conn.unchecked_transaction().unwrap();
         tx.pragma_update(None, "defer_foreign_keys", true).unwrap();
@@ -221,6 +229,13 @@ fn cross_process_child_writer_entry() {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+    let after_clear = std::fs::metadata(&db_path).unwrap().len();
+    if cfg!(windows) {
+        assert!(
+            after_clear < before_clear / 10,
+            "not compacted: {before_clear} -> {after_clear} bytes"
+        );
     }
     std::fs::write(&cleared_path, b"cleared").unwrap();
 
@@ -294,6 +309,22 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    // Readers that have stopped for the clear.
+    let paused = Arc::new(AtomicU64::new(0));
+    let clearing_path = dir.path().join("clearing");
+    let pause = {
+        let paused = paused.clone();
+        let clearing = clearing_path.clone();
+        let cleared = cleared_path.clone();
+        move || {
+            if clearing.exists() && !cleared.exists() {
+                paused.fetch_add(1, Ordering::SeqCst);
+                while !cleared.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    };
     let spotter_polls = Arc::new(AtomicU64::new(0));
     let engineer_scans = Arc::new(AtomicU64::new(0));
     let max_spotter_us = Arc::new(AtomicU64::new(0));
@@ -302,14 +333,26 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
     let spotter_handle = {
         let db = db_path.clone();
         let stop = stop.clone();
+        let pause = pause.clone();
         let polls = spotter_polls.clone();
         let max_us = max_spotter_us.clone();
         std::thread::spawn(move || {
             let conn = open_ro(&db).unwrap();
             conn.busy_timeout(Duration::from_millis(200)).unwrap();
+            // Newest epoch and row seen, which must never go back.
+            let mut newest = (0i64, 0i64);
             while !stop.load(Ordering::Relaxed) {
+                pause();
                 let start = Instant::now();
                 let res: rusqlite::Result<()> = (|| {
+                    let now: (i64, i64) = conn.query_row(
+                        "SELECT (SELECT max(id) FROM epoch), \
+                         (SELECT coalesce(max(id), 0) FROM telemetry)",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    assert!(now >= newest, "went back from {newest:?} to {now:?}");
+                    newest = now;
                     let player: Option<(i64, i64)> = conn
                         .query_row(
                             "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
@@ -368,12 +411,20 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
     let engineer_handle = {
         let db = db_path.clone();
         let stop = stop.clone();
+        let pause = pause.clone();
         let scans = engineer_scans.clone();
         std::thread::spawn(move || {
             let conn = open_ro(&db).unwrap();
             conn.busy_timeout(Duration::from_millis(500)).unwrap();
             while !stop.load(Ordering::Relaxed) {
+                pause();
                 let res: rusqlite::Result<()> = (|| {
+                    let (rows, wheels): (i64, i64) = conn.query_row(
+                        "SELECT (SELECT count(*) FROM telemetry), (SELECT count(*) FROM telemetry_wheel)",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    assert_eq!(wheels, rows * 4, "inconsistent snapshot");
                     let mut laps = conn.prepare_cached(
                         "SELECT vehicle_id, lap, MIN(id), MAX(id), MAX(speed) FROM telemetry GROUP BY vehicle_id, lap",
                     )?;
@@ -418,6 +469,18 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
             }
         })
     };
+
+    // Tells the child when both readers have paused for the clear.
+    while !clearing_path.exists() && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if clearing_path.exists() {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while paused.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(dir.path().join("paused"), b"").unwrap();
+    }
 
     let status = child.wait().expect("failed waiting for child writer");
     stop.store(true, Ordering::Relaxed);

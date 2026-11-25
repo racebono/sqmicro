@@ -237,9 +237,14 @@ fn setup() {
 }
 
 fn open(path: &Path) -> Connection {
+    open_uri(path, "")
+}
+
+/// Opens with more URI parameters, such as `&cache_mib=0`.
+fn open_uri(path: &Path, params: &str) -> Connection {
     setup();
     Connection::open_with_flags(
-        format!("{}?vfs={VFS_NAME}", uri(path).unwrap()),
+        format!("{}?vfs={VFS_NAME}{params}", uri(path).unwrap()),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_URI,
@@ -580,6 +585,130 @@ fn failed_transaction_without_a_journal_file_is_not_published() {
         assert_intact(&reopened);
     }
     assert!(failures >= 3, "only {failures} failures");
+}
+
+#[test]
+fn failed_rollback_without_a_journal_file_publishes_nothing() {
+    let mut failures = 0;
+    for syncs in 0..4 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let conn = open(&db);
+        conn.execute_batch(
+            "PRAGMA journal_mode = MEMORY;
+             PRAGMA cache_size = 10;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO t SELECT i, zeroblob(500) FROM n;
+             BEGIN;
+             UPDATE t SET v = randomblob(500);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+             INSERT INTO t SELECT i + 2000, randomblob(500) FROM n;",
+        )
+        .unwrap();
+        SYNCS_LEFT.set(syncs);
+        failures += conn.execute_batch("ROLLBACK").is_err() as u32;
+        SYNCS_LEFT.set(u32::MAX);
+        let other = open(&db);
+        for conn in [&other, &conn] {
+            assert_eq!(int(conn, "SELECT count(*) FROM t"), 2000, "{syncs} syncs");
+            assert_eq!(
+                int(conn, "SELECT count(*) FROM t WHERE v <> zeroblob(500)"),
+                0
+            );
+            assert_intact(conn);
+        }
+    }
+    // SQLite reports success regardless.
+    assert_eq!(failures, 0);
+}
+
+/// Readers in a transaction keep compaction from moving the pages they are reading, and those that
+/// keep their connection read the moved pages afterwards.
+#[cfg(windows)]
+#[test]
+fn compaction_waits_for_readers_and_moves_pages_under_idle_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let writer = open(&db);
+    writer
+        .execute_batch(
+            "PRAGMA auto_vacuum = FULL;
+             PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE keep (id INTEGER PRIMARY KEY, v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+             INSERT INTO keep SELECT i, randomblob(2000) FROM n;
+             CREATE TABLE junk (v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 800)
+             INSERT INTO junk SELECT randomblob(8000) FROM n;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    let digest = "SELECT group_concat(hex(v), '') FROM keep";
+    let want: String = writer.query_row(digest, [], |r| r.get(0)).unwrap();
+    let size = || std::fs::metadata(&db).unwrap().len();
+    let before = size();
+
+    let reading = open_uri(&db, "&cache_mib=0");
+    let idle = open(&db);
+    let got: String = idle.query_row(digest, [], |r| r.get(0)).unwrap();
+    assert_eq!(got, want);
+
+    writer.execute_batch("DELETE FROM junk").unwrap();
+    reading.execute_batch("BEGIN").unwrap();
+    assert_eq!(int(&reading, "SELECT count(*) FROM keep WHERE id = 1"), 1);
+    // Copies everything back, and would compact if it weren't for `reading`.
+    writer
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            assert_eq!(r.get::<_, i64>(1)?, r.get::<_, i64>(2)?);
+            Ok(())
+        })
+        .unwrap();
+    let got: String = reading.query_row(digest, [], |r| r.get(0)).unwrap();
+    assert_eq!(got, want);
+    reading.execute_batch("COMMIT").unwrap();
+    assert!(size() >= before);
+
+    writer
+        .execute_batch("DELETE FROM keep WHERE id > 250; PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert!(
+        size() < before / 4,
+        "not compacted: {before} -> {} bytes",
+        size()
+    );
+    let want: String = writer.query_row(digest, [], |r| r.get(0)).unwrap();
+    for conn in [&idle, &reading] {
+        let got: String = conn.query_row(digest, [], |r| r.get(0)).unwrap();
+        assert_eq!(got, want);
+        assert_intact(conn);
+    }
+}
+
+/// Rollback-mode commits shrink the file once the journal is finalized, with nothing staged.
+#[cfg(windows)]
+#[test]
+fn rollback_mode_commits_compact_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let conn = open(&db);
+    conn.execute_batch(
+        "PRAGMA auto_vacuum = FULL;
+         PRAGMA journal_mode = DELETE;
+         CREATE TABLE t (v BLOB);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 700)
+         INSERT INTO t SELECT randomblob(8000) FROM n;",
+    )
+    .unwrap();
+    let before = std::fs::metadata(&db).unwrap().len();
+    conn.execute_batch("DELETE FROM t").unwrap();
+    let after = std::fs::metadata(&db).unwrap().len();
+    assert!(after < before / 10, "{before} -> {after} bytes");
+    drop(conn);
+    let reopened = open(&db);
+    assert_eq!(int(&reopened, "SELECT count(*) FROM t"), 0);
+    assert_intact(&reopened);
 }
 
 #[test]
