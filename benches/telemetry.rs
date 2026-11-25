@@ -43,8 +43,26 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5.0);
     let source_db: Option<PathBuf> = std::env::var_os("SQMICRO_BENCH_DB").map(PathBuf::from);
+    let variant_filter: Option<Vec<String>> = std::env::var("SQMICRO_BENCH_VARIANTS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = match std::env::var_os("SQMICRO_BENCH_DIR") {
+        Some(base) => {
+            let base = PathBuf::from(base);
+            std::fs::create_dir_all(&base).expect("create SQMICRO_BENCH_DIR");
+            tempfile::Builder::new()
+                .prefix("sqmicro-bench-")
+                .tempdir_in(base)
+                .expect("tempdir_in")
+        }
+        None => tempfile::tempdir().expect("tempdir"),
+    };
     if let Some(src) = &source_db {
         println!("Benchmarking replay of real DB: {}\n", src.display());
     } else {
@@ -52,9 +70,9 @@ fn main() {
     }
 
     struct RowResult {
-        label: &'static str,
+        label: String,
         live_bytes: u64,
-        write_s: f64,
+        write_s: Option<f64>,
         compact_bytes: Option<u64>,
         compact_s: Option<f64>,
         spotter_p50_ms: f64,
@@ -63,13 +81,106 @@ fn main() {
         warm_queries: Vec<(&'static str, Duration)>,
     }
 
+    let mut max_clean_tid: Option<i64> = None;
+    let mut warm_runs = 5usize;
     let mut results = Vec::new();
+    if let Some(src) = &source_db {
+        let (src_conn, _) = open_source_ro(src);
+        let ps: i64 = src_conn
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .unwrap();
+        let src_bytes = size_with_wal(src);
+        if src_bytes > 512 * 1024 * 1024 {
+            warm_runs = 2;
+        }
+        max_clean_tid = detect_clean_max_tid(&src_conn);
+        let tel_rows: i64 = match max_clean_tid {
+            Some(m) => src_conn
+                .query_row("SELECT COUNT(*) FROM telemetry WHERE id <= ?1", [m], |r| r.get(0))
+                .unwrap_or(0),
+            None => src_conn
+                .query_row("SELECT COUNT(*) FROM telemetry", [], |r| r.get(0))
+                .unwrap_or(0),
+        };
+        let wheel_rows: i64 = match max_clean_tid {
+            Some(m) => src_conn
+                .query_row("SELECT COUNT(*) FROM telemetry_wheel WHERE telemetry_id <= ?1", [m], |r| r.get(0))
+                .unwrap_or(0),
+            None => src_conn
+                .query_row("SELECT COUNT(*) FROM telemetry_wheel", [], |r| r.get(0))
+                .unwrap_or(0),
+        };
+        let vehicles: i64 = match max_clean_tid {
+            Some(m) => src_conn
+                .query_row("SELECT COUNT(DISTINCT vehicle_id) FROM telemetry WHERE id <= ?1", [m], |r| r.get(0))
+                .unwrap_or(0),
+            None => src_conn
+                .query_row("SELECT COUNT(DISTINCT vehicle_id) FROM telemetry", [], |r| r.get(0))
+                .unwrap_or(0),
+        };
+        let (min_t, max_t): (f64, f64) = match max_clean_tid {
+            Some(m) => src_conn
+                .query_row(
+                    "SELECT COALESCE(MIN(session_time), 0.0), COALESCE(MAX(session_time), 0.0) FROM telemetry WHERE id <= ?1",
+                    [m],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0.0, 0.0)),
+            None => src_conn
+                .query_row(
+                    "SELECT COALESCE(MIN(session_time), 0.0), COALESCE(MAX(session_time), 0.0) FROM telemetry",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0.0, 0.0)),
+        };
+        println!(
+            "Source stats: {:.2} MiB, {tel_rows} telemetry rows, {wheel_rows} wheel rows, {vehicles} vehicles, {:.1} min session span\n",
+            mib(src_bytes),
+            (max_t - min_t) / 60.0
+        );
+        let (spotter_p50_ms, spotter_p99_ms) = bench_spotter_conn(&src_conn, max_clean_tid);
+        let cold_queries = run_engineer_workload(&src_conn, max_clean_tid);
+        let mut warm_queries = run_engineer_workload(&src_conn, max_clean_tid);
+        for _ in 1..warm_runs {
+            let run = run_engineer_workload(&src_conn, max_clean_tid);
+            for (best, (_, d)) in warm_queries.iter_mut().zip(run) {
+                best.1 = best.1.min(d);
+            }
+        }
+        drop(src_conn);
+        let label = format!("original ({}K)", ps / 1024);
+        eprintln!(
+            "[done] {label}: {:.2} MiB, spotter {:.3}/{:.3} ms",
+            mib(src_bytes),
+            spotter_p50_ms,
+            spotter_p99_ms
+        );
+        results.push(RowResult {
+            label,
+            live_bytes: src_bytes,
+            write_s: None,
+            compact_bytes: None,
+            compact_s: None,
+            spotter_p50_ms,
+            spotter_p99_ms,
+            cold_queries,
+            warm_queries,
+        });
+    }
+
     for (idx, v) in VARIANTS.iter().enumerate() {
+        if let Some(filters) = &variant_filter {
+            let lower = v.label.to_ascii_lowercase();
+            if !filters.iter().any(|f| lower.contains(f)) {
+                continue;
+            }
+        }
         let db_path = dir.path().join(format!("bench_{idx}.db"));
         let start = Instant::now();
         let conn = open_rw(&db_path, v);
         if let Some(src) = &source_db {
-            replay_real_db(src, &conn);
+            replay_real_db(src, &conn, max_clean_tid);
         } else {
             generate_race(&conn, minutes);
         }
@@ -84,10 +195,10 @@ fn main() {
         drop(conn);
 
         let cold_conn = open_ro(&db_path, v);
-        let cold_queries = run_engineer_workload(&cold_conn);
-        let mut warm_queries = run_engineer_workload(&cold_conn);
-        for _ in 0..4 {
-            let run = run_engineer_workload(&cold_conn);
+        let cold_queries = run_engineer_workload(&cold_conn, None);
+        let mut warm_queries = run_engineer_workload(&cold_conn, None);
+        for _ in 1..warm_runs {
+            let run = run_engineer_workload(&cold_conn, None);
             for (best, (_, d)) in warm_queries.iter_mut().zip(run) {
                 best.1 = best.1.min(d);
             }
@@ -107,15 +218,28 @@ fn main() {
                 },
             )
             .unwrap();
-            (Some(stats.output_bytes), Some(c0.elapsed().as_secs_f64()))
+            let elapsed = c0.elapsed().as_secs_f64();
+            let _ = std::fs::remove_file(&saved);
+            (Some(stats.output_bytes), Some(elapsed))
         } else {
             (None, None)
         };
 
-        results.push(RowResult {
-            label: v.label,
-            live_bytes,
+        remove_db_files(&db_path);
+        eprintln!(
+            "[done] {}: live {:.2} MiB, write {:.2} s, compact {}, spotter {:.3}/{:.3} ms",
+            v.label,
+            mib(live_bytes),
             write_s,
+            compact_bytes.map_or("-".into(), |b| format!("{:.2} MiB", mib(b))),
+            spotter_p50_ms,
+            spotter_p99_ms
+        );
+
+        results.push(RowResult {
+            label: v.label.to_owned(),
+            live_bytes,
+            write_s: Some(write_s),
             compact_bytes,
             compact_s,
             spotter_p50_ms,
@@ -126,10 +250,12 @@ fn main() {
     }
 
     let baseline = results[0].live_bytes as f64;
+    let base_name = &results[0].label;
     println!("### Storage, Write Speed & Live 30 Hz Spotter Latency\n");
-    println!("| Variant | Live Size | vs plain-4K | Write | Compact (L9) | vs plain-4K | Compact Time | Spotter p50 / p99 |");
+    println!("| Variant | Live Size | vs {base_name} | Write | Compact (L9) | vs {base_name} | Compact Time | Spotter p50 / p99 |");
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for r in &results {
+        let write_str = r.write_s.map_or("-".into(), |s| format!("{s:.2} s"));
         let comp_sz = r
             .compact_bytes
             .map_or("-".into(), |b| format!("{:.2} MiB", mib(b)));
@@ -140,11 +266,11 @@ fn main() {
             .compact_s
             .map_or("-".into(), |s| format!("{s:.2} s"));
         println!(
-            "| {} | {:.2} MiB | {:.1}% | {:.2} s | {} | {} | {} | {:.3} / {:.3} ms |",
+            "| {} | {:.2} MiB | {:.1}% | {} | {} | {} | {} | {:.3} / {:.3} ms |",
             r.label,
             mib(r.live_bytes),
             r.live_bytes as f64 / baseline * 100.0,
-            r.write_s,
+            write_str,
             comp_sz,
             comp_pct,
             comp_t,
@@ -153,7 +279,7 @@ fn main() {
         );
     }
 
-    println!("\n### Historical Engineer Queries (cold / warm best-of-5, ms)\n");
+    println!("\n### Historical Engineer Queries (cold / warm best-of-{warm_runs}, ms)\n");
     print!("| Variant |");
     for (name, _) in &results[0].cold_queries {
         print!(" {name} |");
@@ -368,25 +494,102 @@ fn generate_race(conn: &Connection, minutes: f64) {
     tx.commit().unwrap();
 }
 
-fn replay_real_db(src_path: &Path, dst: &Connection) {
+fn open_source_ro(src_path: &Path) -> (Connection, bool) {
     let mut wal_os = src_path.as_os_str().to_owned();
     wal_os.push("-wal");
-    let wal_empty = std::fs::metadata(wal_os).map_or(true, |m| m.len() == 0);
-    let src = if wal_empty {
-        Connection::open_with_flags(
+    let wal_len = std::fs::metadata(&wal_os).map_or(0, |m| m.len());
+    if wal_len == 0 {
+        let conn = Connection::open_with_flags(
             format!("{}?immutable=1", uri(src_path).unwrap()),
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .unwrap()
-    } else {
-        Connection::open_with_flags(
-            src_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap()
+        .unwrap();
+        return (conn, true);
+    }
+    let probe = Connection::open_with_flags(
+        src_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|c| {
+        c.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+        Ok(c)
+    });
+    match probe {
+        Ok(conn) => (conn, false),
+        Err(_) => {
+            let conn = Connection::open_with_flags(
+                format!("{}?immutable=1", uri(src_path).unwrap()),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            (conn, true)
+        }
+    }
+}
+
+fn detect_clean_max_tid(conn: &Connection) -> Option<i64> {
+    let tel_ok = conn
+        .query_row("SELECT MAX(id) FROM telemetry", [], |r| r.get::<_, Option<i64>>(0))
+        .is_ok();
+    let wheel_ok = conn
+        .query_row("SELECT MAX(telemetry_id) FROM telemetry_wheel", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .is_ok();
+    if tel_ok && wheel_ok {
+        return None;
+    }
+    let probe = |tid: i64| -> bool {
+        let a = conn
+            .query_row("SELECT id FROM telemetry WHERE id = ?1", [tid], |r| r.get::<_, i64>(0))
+            .is_ok();
+        let b = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telemetry_wheel WHERE telemetry_id = ?1",
+                [tid],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok();
+        a && b
     };
+    let mut lo = 1i64;
+    let mut hi = conn
+        .query_row("SELECT COALESCE(MAX(telemetry_id), 1) FROM car_state", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(1)
+        .max(1);
+    while probe(hi) {
+        lo = hi;
+        hi = hi.saturating_mul(2);
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if probe(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let safe_max = (lo - 100).max(1);
+    eprintln!(
+        "note: source DB has truncated tail past telemetry id ~{lo}; replaying clean prefix id <= {safe_max}"
+    );
+    Some(safe_max)
+}
+
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut os = path.as_os_str().to_owned();
+        os.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(os));
+    }
+}
+
+fn replay_real_db(src_path: &Path, dst: &Connection, max_tid: Option<i64>) {
+    let (src, _) = open_source_ro(src_path);
     let ddl: Vec<String> = src
         .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, rowid")
         .unwrap()
@@ -416,16 +619,45 @@ fn replay_real_db(src_path: &Path, dst: &Connection) {
             .unwrap();
         let col_list = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
         let placeholders = vec!["?"; cols.len()].join(", ");
-        let mut sel = src.prepare(&format!("SELECT {col_list} FROM \"{table}\"")).unwrap();
+        let select_sql = match (table.as_str(), max_tid) {
+            ("telemetry", Some(m)) => format!("SELECT {col_list} FROM \"telemetry\" WHERE id <= {m}"),
+            ("telemetry_wheel", Some(m)) => {
+                format!("SELECT {col_list} FROM \"telemetry_wheel\" WHERE telemetry_id <= {m}")
+            }
+            ("car_state", Some(m)) => {
+                format!("SELECT {col_list} FROM \"car_state\" WHERE telemetry_id <= {m}")
+            }
+            _ => format!("SELECT {col_list} FROM \"{table}\""),
+        };
+        let mut sel = src.prepare(&select_sql).unwrap();
         let mut ins = dst
-            .prepare(&format!("INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders})"))
+            .prepare(&format!("INSERT OR IGNORE INTO \"{table}\" ({col_list}) VALUES ({placeholders})"))
             .unwrap();
         let mut rows = sel.query([]).unwrap();
         let mut tx = dst.unchecked_transaction().unwrap();
         let mut n = 0usize;
         while let Some(row) = rows.next().unwrap() {
-            let vals: Vec<Value> = (0..cols.len()).map(|i| row.get::<_, Value>(i).unwrap()).collect();
-            ins.execute(rusqlite::params_from_iter(vals)).unwrap();
+            for i in 0..cols.len() {
+                match row.get_ref(i).unwrap() {
+                    rusqlite::types::ValueRef::Null => {
+                        ins.raw_bind_parameter(i + 1, rusqlite::types::Null).unwrap();
+                    }
+                    rusqlite::types::ValueRef::Integer(v) => {
+                        ins.raw_bind_parameter(i + 1, v).unwrap();
+                    }
+                    rusqlite::types::ValueRef::Real(v) => {
+                        ins.raw_bind_parameter(i + 1, v).unwrap();
+                    }
+                    rusqlite::types::ValueRef::Text(v) => {
+                        let s = std::str::from_utf8(v).unwrap();
+                        ins.raw_bind_parameter(i + 1, s).unwrap();
+                    }
+                    rusqlite::types::ValueRef::Blob(v) => {
+                        ins.raw_bind_parameter(i + 1, v).unwrap();
+                    }
+                }
+            }
+            ins.raw_execute().unwrap();
             n += 1;
             if n % 2000 == 0 {
                 tx.commit().unwrap();
@@ -438,21 +670,38 @@ fn replay_real_db(src_path: &Path, dst: &Connection) {
 
 fn bench_spotter(path: &Path, v: &Variant) -> (f64, f64) {
     let conn = open_ro(path, v);
+    bench_spotter_conn(&conn, None)
+}
+
+fn bench_spotter_conn(conn: &Connection, max_tid: Option<i64>) -> (f64, f64) {
     let mut times = Vec::with_capacity(60);
     for _ in 0..60 {
         let t0 = Instant::now();
-        let player: (i64, i64) = conn
-            .query_row(
-                "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
+        let player: (i64, i64) = match max_tid {
+            Some(m) => conn
+                .query_row(
+                    "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 AND id <= ?1 ORDER BY id DESC LIMIT 1",
+                    [m],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap(),
+            None => conn
+                .query_row(
+                    "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap(),
+        };
+        let hi = match max_tid {
+            Some(m) => (player.0 + 10).min(m),
+            None => player.0 + 10,
+        };
         let mut stmt = conn
             .prepare_cached("SELECT id, vehicle_id, speed, lap_distance FROM telemetry WHERE id BETWEEN ?1 AND ?2")
             .unwrap();
         let _rows: Vec<(i64, i64, f64, f64)> = stmt
-            .query_map(params![(player.0 - 110).max(1), player.0 + 10], |r| {
+            .query_map(params![(player.0 - 110).max(1), hi], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .unwrap()
@@ -466,7 +715,7 @@ fn bench_spotter(path: &Path, v: &Variant) -> (f64, f64) {
     (p50, p99)
 }
 
-fn run_engineer_workload(conn: &Connection) -> Vec<(&'static str, Duration)> {
+fn run_engineer_workload(conn: &Connection, max_tid: Option<i64>) -> Vec<(&'static str, Duration)> {
     let mut out = Vec::new();
     let mut time = |name: &'static str, f: &mut dyn FnMut()| {
         let t0 = Instant::now();
@@ -476,13 +725,22 @@ fn run_engineer_workload(conn: &Connection) -> Vec<(&'static str, Duration)> {
 
     let mut player = (0i64, 0i64);
     time("player last", &mut || {
-        player = conn
-            .query_row(
-                "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
+        player = match max_tid {
+            Some(m) => conn
+                .query_row(
+                    "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 AND id <= ?1 ORDER BY id DESC LIMIT 1",
+                    [m],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap(),
+            None => conn
+                .query_row(
+                    "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap(),
+        };
     });
 
     let mut laps = Vec::<(i64, i64, i64)>::new();
@@ -490,7 +748,7 @@ fn run_engineer_workload(conn: &Connection) -> Vec<(&'static str, Duration)> {
         laps = conn
             .prepare(
                 "SELECT vehicle_id, lap, MIN(id), MAX(id), MAX(lap_start_time), MAX(in_pit_lane), MAX(speed) \
-                 FROM telemetry WHERE id BETWEEN ?1 AND ?2 GROUP BY vehicle_id, lap",
+                 FROM telemetry WHERE id BETWEEN ?1 AND ?2 GROUP BY epoch, vehicle_id, lap",
             )
             .unwrap()
             .query_map(params![0, player.0], |r| {

@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 
 pub const MAGIC: [u8; 8] = *b"SQMICRO1";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const SUPERBLOCK_SIZE: usize = 4096;
 pub const SUPERBLOCK_REGION: u64 = 8192;
 pub const LOCK_HOLE_START: u64 = 0x4000_0000;
@@ -15,34 +15,6 @@ pub const CHUNK_HEADER_SIZE: usize = 8;
 pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_CHUNK_PAGES: usize = 64;
 pub const MAX_FILE_OFFSET: u64 = (1u64 << 38) * 16;
-
-const CRC32C_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x82F6_3B78
-            } else {
-                crc >> 1
-            };
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
-
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        crc = CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
-}
 
 #[inline]
 pub fn align16(v: u64) -> u64 {
@@ -157,7 +129,7 @@ impl Superblock {
         buf[88..92].copy_from_slice(&self.dict_len.to_le_bytes());
         // 92..96 reserved0 = 0
         buf[96..196].copy_from_slice(&self.sqlite_header);
-        let crc = crc32c(&buf[..4092]);
+        let crc = crc32fast::hash(&buf[..4092]);
         buf[4092..4096].copy_from_slice(&crc.to_le_bytes());
         buf
     }
@@ -166,12 +138,12 @@ impl Superblock {
         if buf[0..8] != MAGIC {
             return None;
         }
-        let stored_crc = u32::from_le_bytes(buf[4092..4096].try_into().ok()?);
-        if crc32c(&buf[..4092]) != stored_crc {
-            return None;
-        }
         let format_version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
         if format_version != FORMAT_VERSION {
+            return None;
+        }
+        let stored_crc = u32::from_le_bytes(buf[4092..4096].try_into().ok()?);
+        if crc32fast::hash(&buf[..4092]) != stored_crc {
             return None;
         }
         let flags = u32::from_le_bytes(buf[12..16].try_into().ok()?);
@@ -237,6 +209,16 @@ impl Superblock {
             (None, Some(sb)) => Some(sb),
             (None, None) => None,
         }
+    }
+
+    /// Format version claimed by a sqmicro file this build cannot read. Only meaningful
+    /// once `select_latest` found no valid slot, as the version is not checksum-verified.
+    pub fn unsupported_version(region: &[u8; SUPERBLOCK_REGION as usize]) -> Option<u32> {
+        region
+            .chunks_exact(SUPERBLOCK_SIZE)
+            .filter(|slot| slot[0..8] == MAGIC)
+            .map(|slot| u32::from_le_bytes([slot[8], slot[9], slot[10], slot[11]]))
+            .find(|&version| version != FORMAT_VERSION)
     }
 }
 
@@ -402,8 +384,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crc32c_matches_known_vector() {
-        assert_eq!(crc32c(b"123456789"), 0xe3069283);
+    fn superblock_checksum_is_crc32_ieee() {
+        // Pins the on-disk algorithm: changing it requires a FORMAT_VERSION bump.
+        assert_eq!(crc32fast::hash(b"123456789"), 0xcbf43926);
+        let mut sb = Superblock::empty();
+        sb.generation = 1;
+        let buf = sb.encode();
+        assert_eq!(buf[4092..], crc32fast::hash(&buf[..4092]).to_le_bytes());
     }
 
     #[test]

@@ -1041,7 +1041,13 @@ fn read_superblock<B: BlockIo>(io: &mut B) -> Result<Option<Superblock>> {
     if n < SUPERBLOCK_SIZE {
         return Ok(None);
     }
-    Ok(Superblock::select_latest(&region))
+    if let Some(sb) = Superblock::select_latest(&region) {
+        return Ok(Some(sb));
+    }
+    match Superblock::unsupported_version(&region) {
+        Some(version) => Err(Error::UnsupportedVersion(version)),
+        None => Ok(None),
+    }
 }
 
 fn read_l1<B: BlockIo>(io: &mut B, sb: &Superblock) -> Result<Vec<u64>> {
@@ -1140,6 +1146,37 @@ mod tests {
         let mut plain = vec![0u8; 4096];
         plain[..16].copy_from_slice(b"SQLite format 3\0");
         mem.write_at(0, &plain).unwrap();
+        assert!(matches!(
+            PageStore::open(mem, Config::default(), true),
+            Err(Error::NotASqmicroDb)
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_format_version_without_modifying_file() {
+        let mem = MemBlockIo::shared();
+        let mut sb = Superblock::empty();
+        sb.generation = 2;
+        sb.format_version = 1;
+        mem.clone().write_at(sb.slot_offset(), &sb.encode()).unwrap();
+        let before = mem.0.borrow().clone();
+        for read_only in [true, false] {
+            assert!(matches!(
+                PageStore::open(mem.clone(), Config::default(), read_only),
+                Err(Error::UnsupportedVersion(1))
+            ));
+        }
+        assert_eq!(*mem.0.borrow(), before);
+    }
+
+    #[test]
+    fn corrupt_current_version_superblock_is_not_reported_as_unsupported() {
+        let mem = MemBlockIo::shared();
+        let mut sb = Superblock::empty();
+        sb.generation = 2;
+        let mut bytes = sb.encode();
+        bytes[40] ^= 0xff;
+        mem.clone().write_at(sb.slot_offset(), &bytes).unwrap();
         assert!(matches!(
             PageStore::open(mem, Config::default(), true),
             Err(Error::NotASqmicroDb)

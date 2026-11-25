@@ -10,6 +10,7 @@ pub enum Error {
     Zstd(String),
     InvalidConfig(String),
     NotASqmicroDb,
+    UnsupportedVersion(u32),
     InvalidPath(String),
 }
 
@@ -22,6 +23,9 @@ impl fmt::Display for Error {
             Error::Zstd(msg) => write!(f, "zstd error: {msg}"),
             Error::InvalidConfig(msg) => write!(f, "invalid sqmicro configuration: {msg}"),
             Error::NotASqmicroDb => write!(f, "file is not a sqmicro database"),
+            Error::UnsupportedVersion(v) => {
+                write!(f, "unsupported sqmicro format version {v}")
+            }
             Error::InvalidPath(msg) => write!(f, "invalid database path: {msg}"),
         }
     }
