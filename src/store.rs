@@ -129,6 +129,11 @@ pub struct PageStore<B: BlockIo> {
     /// The current superblock may not be on the disk: it was read from the file, or a sync failed
     /// after it was written.
     base_unsynced: bool,
+    /// The current superblock may not be on the disk because it was written since the last sync,
+    /// or for a reason in `base_unsynced`. A failed sync through another handle can lose it.
+    superblock_unsynced: bool,
+    /// The last sync failed.
+    sync_failed: bool,
     /// A sync failed after pages were spilled, so they may never reach the disk.
     spills_unsure: bool,
 
@@ -151,6 +156,8 @@ impl<B: BlockIo> PageStore<B> {
             config,
             read_only,
             base_unsynced: superblock.is_some(),
+            superblock_unsynced: superblock.is_some(),
+            sync_failed: false,
             spills_unsure: false,
             superblock,
             l1,
@@ -197,6 +204,7 @@ impl<B: BlockIo> PageStore<B> {
         self.chunk_cache.clear();
         self.reset_staged();
         self.base_unsynced = true;
+        self.superblock_unsynced = true;
         self.stale = true;
     }
 
@@ -256,6 +264,7 @@ impl<B: BlockIo> PageStore<B> {
         self.l1 = new_l1;
         self.superblock = Some(new_sb);
         self.base_unsynced = true;
+        self.superblock_unsynced = true;
         self.reset_staged();
         self.stale = false;
         Ok(())
@@ -572,6 +581,7 @@ impl<B: BlockIo> PageStore<B> {
             return Err(e);
         }
         self.superblock = Some(sb);
+        self.superblock_unsynced = true;
         self.reset_staged();
         Ok(())
     }
@@ -591,19 +601,28 @@ impl<B: BlockIo> PageStore<B> {
     /// it points to was synced before it was written, and the bytes are the same, so readers can't
     /// catch it half written.
     fn sync(&mut self) -> Result<()> {
-        if self.base_unsynced
+        if self.superblock_unsynced
             && let Some(sb) = &self.superblock
         {
             let encoded = sb.encode();
             let mut slot = [0u8; SUPERBLOCK_SIZE];
-            // Unless another process has written that slot since.
             if self.io.read_at(sb.slot_offset(), &mut slot)? == SUPERBLOCK_SIZE && slot == encoded {
                 self.io.write_at(sb.slot_offset(), &encoded)?;
+            } else if self.base_unsynced {
+                // Gone from the file without having reached the disk, or replaced by another
+                // process. Either way, what is there has to be read again.
+                self.stale = true;
+                return Err(Error::Io(std::io::Error::other(
+                    "the superblock changed while it was in use",
+                )));
             }
         }
         let res = self.io.sync();
-        self.base_unsynced = res.is_err();
-        if res.is_err() && self.has_unflushed_spills {
+        let failed = res.is_err();
+        self.base_unsynced = failed;
+        self.superblock_unsynced = failed;
+        self.sync_failed = failed;
+        if failed && self.has_unflushed_spills {
             self.spills_unsure = true;
         }
         res
@@ -629,6 +648,10 @@ impl<B: BlockIo> PageStore<B> {
             return self.truncate_staged(new_size);
         }
         self.refresh()?;
+        // As when a commit published, but then failed to sync, and is being rolled back.
+        if self.sync_failed {
+            return self.truncate_staged(new_size);
+        }
 
         let (page_size, old_page_count) = self.current_geometry();
         if page_size == 0 {
@@ -724,22 +747,27 @@ impl<B: BlockIo> PageStore<B> {
         if new_page_count >= self.staged_page_count {
             return Ok(());
         }
+        let kept_l2 = new_page_count.div_ceil(L2_ENTRIES as u64) as u32;
+        let rem = (new_page_count % L2_ENTRIES as u64) as usize;
+        // The only step that can fail, so it goes before anything changes.
+        let last_l2 = if rem != 0 && !self.dirty_l2.contains_key(&(kept_l2 - 1)) {
+            Some(self.load_committed_l2(kept_l2 - 1)?)
+        } else {
+            None
+        };
         let dropped = self.pending_writes.split_off(&(new_page_count + 1));
         self.pending_bytes -= dropped.len() * ps as usize;
         // Should the database grow again before the flush, the pages that were there are gone.
-        let kept_l2 = new_page_count.div_ceil(L2_ENTRIES as u64) as u32;
         let staged_l2 = self.staged_page_count.div_ceil(L2_ENTRIES as u64) as u32;
         for idx in kept_l2..staged_l2.max(self.l1.len() as u32) {
             self.dirty_l2.insert(idx, L2Page::empty());
         }
-        let rem = (new_page_count % L2_ENTRIES as u64) as usize;
         if rem != 0 {
-            let idx = kept_l2 - 1;
-            if !self.dirty_l2.contains_key(&idx) {
-                let base = self.load_committed_l2(idx)?;
-                self.dirty_l2.insert(idx, base);
-            }
-            self.dirty_l2.get_mut(&idx).unwrap().entries[rem..].fill(DirEntry::EMPTY);
+            let l2 = match last_l2 {
+                Some(base) => self.dirty_l2.entry(kept_l2 - 1).or_insert(base),
+                None => self.dirty_l2.get_mut(&(kept_l2 - 1)).unwrap(),
+            };
+            l2.entries[rem..].fill(DirEntry::EMPTY);
         }
         self.staged_page_count = new_page_count;
         if new_page_count == 0 {
@@ -1624,6 +1652,7 @@ mod tests {
         /// Fail the write at this offset once the file has it (`true`) or before (`false`).
         fail_write: Option<(u64, bool)>,
         fail_sync: bool,
+        fail_read: bool,
         /// Fail the operation that comes after this many others, once the file has it (`true`) or
         /// before (`false`). Syncs that fail have no effect.
         fail_op: Option<(u32, bool)>,
@@ -1707,6 +1736,9 @@ mod tests {
         fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
             let s = self.0.borrow();
             assert!(buf.len() <= 1 << 24, "read of {} bytes", buf.len());
+            if s.fail_read {
+                return Err(injected());
+            }
             let off = (offset as usize).min(s.current.len());
             let n = (s.current.len() - off).min(buf.len());
             buf[..n].copy_from_slice(&s.current[off..off + n]);
@@ -2046,8 +2078,68 @@ mod tests {
             put(&mut b, 1, tag);
             b.flush(true).unwrap();
         }
-        a.flush(true).unwrap();
+        assert!(a.flush(true).is_err());
+        assert!(a.is_stale());
+        a.refresh().unwrap();
+        assert_eq!(contents(&mut a).unwrap(), [3]);
         assert_eq!(reopened(&io.0.borrow().current), [3]);
+    }
+
+    #[test]
+    fn superblock_lost_through_another_handle_is_written_again() {
+        let io = CrashIo::default();
+        let mut a = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut a, pgno, pgno);
+        }
+        a.flush(true).unwrap();
+        let mut states = vec![contents(&mut a).unwrap()];
+        let mut b = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut a, pgno, 100 + pgno);
+        }
+        a.flush(false).unwrap();
+        let published = contents(&mut a).unwrap();
+        states.push(published.clone());
+        // Loses what a wrote, without a knowing.
+        io.0.borrow_mut().fail_sync = true;
+        assert!(b.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+
+        io.0.borrow_mut().record = true;
+        put(&mut a, 41, 41);
+        a.flush(false).unwrap();
+        states.push(contents(&mut a).unwrap());
+        for file in &io.0.borrow().crashes {
+            assert!(states.contains(&reopened(file)));
+        }
+        // Once a has synced, a crash doesn't go back further than what it had published.
+        assert_eq!(reopened(&io.0.borrow().durable), published);
+    }
+
+    #[test]
+    fn failed_staged_truncate_changes_nothing() {
+        let io = CrashIo::default();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=1100 {
+            put(&mut store, pgno, pgno);
+        }
+        store.flush(true).unwrap();
+        let old = contents(&mut store).unwrap();
+        let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        // All past the cut, and in another L2 page than the one it trims.
+        for pgno in 1030..=1100 {
+            put(&mut store, pgno, 10_000 + pgno);
+        }
+        io.0.borrow_mut().fail_read = true;
+        assert!(store.truncate(600 * PS as u64, None).is_err());
+        io.0.borrow_mut().fail_read = false;
+        assert!(store.has_pending_writes());
+        assert_eq!(store.logical_size().unwrap(), 1100 * PS as u64);
+        store.discard_staged();
+        store.flush(true).unwrap();
+        assert_eq!(contents(&mut store).unwrap(), old);
+        assert_eq!(reopened(&io.0.borrow().current), old);
     }
 
     #[test]

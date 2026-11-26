@@ -15,6 +15,8 @@ thread_local! {
     static FAIL_WRITES: Cell<u32> = const { Cell::new(0) };
     /// Fails this thread's next sync of a main database file.
     static FAIL_NEXT_SYNC: Cell<bool> = const { Cell::new(false) };
+    /// Fails this thread's syncs of main database files whose bit is set, counting from bit 0.
+    static FAIL_SYNCS: Cell<u32> = const { Cell::new(0) };
     /// Lets this many of this thread's syncs of main database files through, then fails them.
     static SYNCS_LEFT: Cell<u32> = const { Cell::new(u32::MAX) };
     /// Runs once, right after this thread's connection has locked a WAL read mark.
@@ -125,6 +127,11 @@ unsafe extern "C" fn os_write(
 
 unsafe extern "C" fn os_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     if FAIL_NEXT_SYNC.take() {
+        return ffi::SQLITE_IOERR_FSYNC;
+    }
+    let mask = FAIL_SYNCS.get();
+    FAIL_SYNCS.set(mask >> 1);
+    if mask & 1 != 0 {
         return ffi::SQLITE_IOERR_FSYNC;
     }
     match SYNCS_LEFT.get() {
@@ -709,6 +716,44 @@ fn rollback_mode_commits_compact_the_file() {
     let reopened = open(&db);
     assert_eq!(int(&reopened, "SELECT count(*) FROM t"), 0);
     assert_intact(&reopened);
+}
+
+#[test]
+fn commit_without_a_journal_file_is_whole_or_absent_after_failed_syncs() {
+    // Always the one after the commit has published (bit 1), and any others among the first few,
+    // such as two in its rollback.
+    for mask in (0..128u32).filter(|mask| mask & 2 != 0) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let conn = open(&db);
+        conn.execute_batch(
+            "PRAGMA journal_mode = MEMORY;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+             INSERT INTO t SELECT i, zeroblob(500) FROM n;",
+        )
+        .unwrap();
+        FAIL_SYNCS.set(mask);
+        let res = conn.execute_batch(
+            "BEGIN;
+             UPDATE t SET v = randomblob(500);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO t SELECT i + 200, randomblob(500) FROM n;
+             COMMIT;",
+        );
+        FAIL_SYNCS.set(0);
+        if res.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        let other = open(&db);
+        let rows = int(&other, "SELECT count(*) FROM t");
+        let old = int(&other, "SELECT count(*) FROM t WHERE v = zeroblob(500)");
+        assert!(
+            (rows, old) == (200, 200) || (rows, old) == (2200, 0),
+            "{mask:b}: {rows} {old}"
+        );
+        assert_intact(&other);
+    }
 }
 
 #[test]
