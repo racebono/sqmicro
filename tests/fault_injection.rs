@@ -864,6 +864,58 @@ fn superblock_lost_after_a_partial_checkpoint_loses_no_frames() {
 }
 
 #[test]
+fn commits_succeed_while_a_failed_checkpoint_is_pending_in_exclusive_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let conn = wal_database(&db);
+    conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE; UPDATE t SET v = 2")
+        .unwrap();
+    // Only the database file is full, not the WAL.
+    FAIL_WRITES.set(u32::MAX);
+    assert!(
+        conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))
+            .is_err()
+    );
+    let res = conn.execute_batch("INSERT INTO other VALUES (42)");
+    FAIL_WRITES.set(0);
+    res.unwrap();
+    drop(conn);
+    let reopened = open(&db);
+    assert_eq!(int(&reopened, "SELECT count(*) FROM other"), 1);
+    assert_eq!(int(&reopened, "SELECT v FROM t"), 2);
+    assert_intact(&reopened);
+}
+
+#[test]
+fn rollback_mode_commits_report_what_they_did_after_failed_syncs() {
+    for mask in 0..64u32 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let conn = open(&db);
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = FULL;
+             PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+             INSERT INTO t SELECT i, randomblob(500) FROM n;",
+        )
+        .unwrap();
+        FAIL_SYNCS.set(mask);
+        let res = conn.execute_batch("DELETE FROM t WHERE id > 10");
+        FAIL_SYNCS.set(0);
+        drop(conn);
+        let reopened = open(&db);
+        let rows = int(&reopened, "SELECT count(*) FROM t");
+        assert_eq!(
+            rows,
+            if res.is_ok() { 10 } else { 300 },
+            "{mask:b}: {res:?}"
+        );
+        assert_intact(&reopened);
+    }
+}
+
+#[test]
 fn failed_sync_in_exclusive_locking_mode_is_rolled_back_at_once() {
     for journal in ["DELETE", "MEMORY", "OFF"] {
         let dir = tempfile::tempdir().unwrap();

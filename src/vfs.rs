@@ -913,10 +913,15 @@ unsafe extern "C" fn io_file_control(
         // `synchronous=OFF` skips.
         // COMMIT_PHASETWO follows the truncate at the end of a rollback-journal commit.
         if op == ffi::SQLITE_FCNTL_SYNC || op == ffi::SQLITE_FCNTL_COMMIT_PHASETWO {
-            if let Err(e) = state.store.flush(false) {
-                return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+            match state.store.flush(false) {
+                Ok(()) => state.store.compact_if_truncated(state.compact_lock.as_ref()),
+                Err(e) if op == ffi::SQLITE_FCNTL_SYNC => {
+                    return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+                }
+                // The commit is durable already. What is left is that truncation, which SQLite
+                // does without, or the pages of a failed checkpoint, which the WAL still has.
+                Err(_) => state.store.discard_staged(),
             }
-            state.store.compact_if_truncated(state.compact_lock.as_ref());
         }
         match op {
             ffi::SQLITE_FCNTL_SIZE_HINT | ffi::SQLITE_FCNTL_CHUNK_SIZE => ffi::SQLITE_OK,
