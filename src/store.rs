@@ -455,6 +455,8 @@ impl<B: BlockIo> PageStore<B> {
         }
 
         self.spill_pending_chunks()?;
+        // As for the spill, which doesn't run if only a truncation is staged.
+        self.prepare_append()?;
 
         let page_count = self.staged_page_count;
         // An empty database can start again with any page size.
@@ -903,7 +905,9 @@ impl<B: BlockIo> PageStore<B> {
         self.sync()?; // the copy must be what a crash falls back to before its source goes
 
         let (mut sb, l1) = self.write_copy(&chunks, SUPERBLOCK_REGION)?;
-        sb.compact_id += 1; // offsets are reused, so readers must drop their caches
+        // Offsets are reused, so readers must drop their caches. The id is new even if a failed
+        // sync lost the last compaction's: it is at least the generation this copy will get.
+        sb.compact_id = (sb.compact_id + 1).max(sb.generation + 1 + 2 * self.failed_publishes);
         self.publish_copy(sb, l1)?;
         self.sync()?;
 
@@ -2214,6 +2218,94 @@ mod tests {
         // The same pages at the same sizes: the superblock would be the same, given the same space.
         let pages: Vec<u64> = (2..=40).collect();
         reader_after_lost_superblock(&pages, &[&pages]);
+    }
+
+    #[test]
+    fn compaction_after_a_lost_compaction_still_clears_reader_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        std::fs::write(&path, b"").unwrap();
+        let lock = crate::lock::CompactLock::open(&path).unwrap();
+        let base = {
+            let io = CrashIo::default();
+            let mut store = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for pgno in 1..=1600 {
+                put(&mut store, pgno, pgno);
+            }
+            store.flush(true).unwrap();
+            io.0.borrow().current.clone()
+        };
+        let latest = |io: &CrashIo| {
+            let s = io.0.borrow();
+            Superblock::select_latest(s.current[..SUPERBLOCK_REGION as usize].try_into().unwrap())
+                .unwrap()
+        };
+        let mut lost = 0;
+        for op in 0.. {
+            let io = CrashIo::from_file(base.clone());
+            let mut w = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            contents(&mut w).unwrap();
+            let before = w.superblock().unwrap().compact_id;
+            io.0.borrow_mut().fail_op = Some((op, false));
+            let _ = w.truncate(40 * PS as u64, Some(&lock));
+            if io.0.borrow_mut().fail_op.take().is_some() {
+                break;
+            }
+            if latest(&io).compact_id == before {
+                continue;
+            }
+            // A reader reads through the compacted superblock, then the file loses it.
+            let mut r = PageStore::open(io.clone(), Config::default(), true).unwrap();
+            contents(&mut r).unwrap();
+            evict_superblock(&io, &w);
+            if latest(&io).compact_id != before {
+                continue;
+            }
+            lost += 1;
+            w.discard_staged();
+            w.refresh().unwrap();
+            for pgno in 1..=1600 {
+                put(&mut w, pgno, 5000 + pgno);
+            }
+            w.flush(true).unwrap();
+            w.truncate(40 * PS as u64, Some(&lock)).unwrap();
+            assert_ne!(w.superblock().unwrap().compact_id, before);
+            let truth = reopened(&io.0.borrow().current);
+            assert_eq!(truth, (5001..=5040).collect::<Vec<_>>());
+            r.mark_stale();
+            r.refresh().unwrap();
+            assert_eq!(contents(&mut r).unwrap(), truth, "op {op}");
+        }
+        assert!(lost > 0, "the compacted superblock was never lost");
+    }
+
+    #[test]
+    fn flush_of_only_a_truncation_after_a_lost_superblock_reuses_no_space() {
+        let io = CrashIo::default();
+        let mut w = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=600 {
+            put(&mut w, pgno, pgno);
+        }
+        w.flush(true).unwrap();
+        w.truncate_later(550 * PS as u64).unwrap();
+        w.flush(false).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(w.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        let mut r = PageStore::open(io.clone(), Config::default(), true).unwrap();
+        assert_eq!(contents(&mut r).unwrap().len(), 550);
+        evict_superblock(&io, &w);
+        w.refresh().unwrap();
+        assert_eq!(w.superblock().unwrap().page_count, 600);
+        w.truncate_later(580 * PS as u64).unwrap();
+        w.flush(true).unwrap();
+        put(&mut w, 1, 9001);
+        w.flush(true).unwrap();
+        let truth = reopened(&io.0.borrow().current);
+        assert_eq!(truth.len(), 580);
+        r.mark_stale();
+        r.refresh().unwrap();
+        assert_eq!(contents(&mut r).unwrap(), truth);
     }
 
     #[test]
