@@ -2,6 +2,7 @@ use crate::Config;
 use crate::error::{Error, Result};
 use crate::store::{FileBlockIo, PageStore};
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,18 +32,10 @@ pub struct CompactStats {
 }
 
 pub fn compact(src: &Path, dst: &Path, opts: CompactOptions) -> Result<CompactStats> {
-    // Reject uncheckpointed non-empty WAL so callers never lose frames silently.
-    let mut wal_os = src.as_os_str().to_owned();
-    wal_os.push("-wal");
-    let wal_path = PathBuf::from(wal_os);
-    if let Ok(meta) = std::fs::metadata(&wal_path)
-        && meta.len() > 0
-    {
-        return Err(Error::InvalidConfig(
-            "source database has an uncheckpointed WAL; run PRAGMA wal_checkpoint(TRUNCATE) first"
-                .into(),
-        ));
-    }
+    // A WAL or hot journal next to the source holds changes that would be lost. Next to the
+    // destination, SQLite would apply it to the new database.
+    reject_pending_wal_or_journal("source", src)?;
+    reject_pending_wal_or_journal("destination", dst)?;
 
     let input_bytes = std::fs::metadata(src)?.len();
     let src_file = OpenOptions::new().read(true).open(src)?;
@@ -107,6 +100,8 @@ pub fn compact(src: &Path, dst: &Path, opts: CompactOptions) -> Result<CompactSt
     drop(tmp_file);
     drop(reader);
 
+    reject_pending_wal_or_journal("source", src)?;
+    reject_pending_wal_or_journal("destination", dst)?;
     replace_file(&tmp_path, dst)?;
     cleanup.0 = None;
 
@@ -116,6 +111,31 @@ pub fn compact(src: &Path, dst: &Path, opts: CompactOptions) -> Result<CompactSt
         output_bytes,
         page_count,
     })
+}
+
+fn reject_pending_wal_or_journal(which: &str, db: &Path) -> Result<()> {
+    let first_byte = |suffix: &str| -> Result<Option<u8>> {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        let mut byte = [0u8; 1];
+        match std::fs::File::open(PathBuf::from(path)).and_then(|mut f| f.read(&mut byte)) {
+            Ok(n) => Ok((n > 0).then_some(byte[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if first_byte("-wal")?.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "{which} database has an uncheckpointed WAL; run PRAGMA wal_checkpoint(TRUNCATE) first"
+        )));
+    }
+    // Like SQLite, ignore a journal whose header was zeroed by `journal_mode=PERSIST`.
+    if first_byte("-journal")?.is_some_and(|b| b != 0) {
+        return Err(Error::InvalidConfig(format!(
+            "{which} database has a hot rollback journal; open it with SQLite first"
+        )));
+    }
+    Ok(())
 }
 
 fn create_temp_file(dir: &Path) -> Result<(PathBuf, std::fs::File)> {

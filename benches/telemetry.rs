@@ -76,7 +76,7 @@ fn main() {
         compact_bytes: Option<u64>,
         compact_s: Option<f64>,
         spotter_p50_ms: f64,
-        spotter_p99_ms: f64,
+        spotter_max_ms: f64,
         cold_queries: Vec<(&'static str, Duration)>,
         warm_queries: Vec<(&'static str, Duration)>,
     }
@@ -139,7 +139,7 @@ fn main() {
             mib(src_bytes),
             (max_t - min_t) / 60.0
         );
-        let (spotter_p50_ms, spotter_p99_ms) = bench_spotter_conn(&src_conn, max_clean_tid);
+        let (spotter_p50_ms, spotter_max_ms) = bench_spotter_conn(&src_conn, max_clean_tid);
         let cold_queries = run_engineer_workload(&src_conn, max_clean_tid);
         let mut warm_queries = run_engineer_workload(&src_conn, max_clean_tid);
         for _ in 1..warm_runs {
@@ -154,7 +154,7 @@ fn main() {
             "[done] {label}: {:.2} MiB, spotter {:.3}/{:.3} ms",
             mib(src_bytes),
             spotter_p50_ms,
-            spotter_p99_ms
+            spotter_max_ms
         );
         results.push(RowResult {
             label,
@@ -163,7 +163,7 @@ fn main() {
             compact_bytes: None,
             compact_s: None,
             spotter_p50_ms,
-            spotter_p99_ms,
+            spotter_max_ms,
             cold_queries,
             warm_queries,
         });
@@ -188,7 +188,7 @@ fn main() {
         let live_bytes = size_with_wal(&db_path);
 
         // Measure 30 Hz spotter tail latency while WAL has active hot tail frames.
-        let (spotter_p50_ms, spotter_p99_ms) = bench_spotter(&db_path, v);
+        let (spotter_p50_ms, spotter_max_ms) = bench_spotter(&db_path, v);
 
         // Checkpoint so historical scan benchmarks read from main DB (compressed for sqmicro).
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
@@ -233,7 +233,7 @@ fn main() {
             write_s,
             compact_bytes.map_or("-".into(), |b| format!("{:.2} MiB", mib(b))),
             spotter_p50_ms,
-            spotter_p99_ms
+            spotter_max_ms
         );
 
         results.push(RowResult {
@@ -243,16 +243,20 @@ fn main() {
             compact_bytes,
             compact_s,
             spotter_p50_ms,
-            spotter_p99_ms,
+            spotter_max_ms,
             cold_queries,
             warm_queries,
         });
     }
 
+    if results.is_empty() {
+        println!("No variant matches SQMICRO_BENCH_VARIANTS.");
+        return;
+    }
     let baseline = results[0].live_bytes as f64;
     let base_name = &results[0].label;
     println!("### Storage, Write Speed & Live 30 Hz Spotter Latency\n");
-    println!("| Variant | Live Size | vs {base_name} | Write | Compact (L9) | vs {base_name} | Compact Time | Spotter p50 / p99 |");
+    println!("| Variant | Live Size | vs {base_name} | Write | Compact (L9) | vs {base_name} | Compact Time | Spotter p50 / slowest |");
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for r in &results {
         let write_str = r.write_s.map_or("-".into(), |s| format!("{s:.2} s"));
@@ -275,7 +279,7 @@ fn main() {
             comp_pct,
             comp_t,
             r.spotter_p50_ms,
-            r.spotter_p99_ms,
+            r.spotter_max_ms,
         );
     }
 
@@ -711,8 +715,7 @@ fn bench_spotter_conn(conn: &Connection, max_tid: Option<i64>) -> (f64, f64) {
     }
     times.sort_by(|a, b| a.total_cmp(b));
     let p50 = times[times.len() / 2];
-    let p99 = times[(times.len() * 99) / 100];
-    (p50, p99)
+    (p50, times[times.len() - 1])
 }
 
 fn run_engineer_workload(conn: &Connection, max_tid: Option<i64>) -> Vec<(&'static str, Duration)> {

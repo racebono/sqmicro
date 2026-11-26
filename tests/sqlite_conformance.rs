@@ -40,7 +40,7 @@ fn wal_mode_crud_without_rowid_blobs_and_integrity_check() {
     register().unwrap();
     register().unwrap(); // idempotent
 
-    for page_size in [4096i64, 8192, 16384, 32768, 65536] {
+    for page_size in [512i64, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
         let dir = tempfile::tempdir().unwrap();
         let compressed = dir.path().join(format!("comp_{page_size}.db"));
         let plain = dir.path().join(format!("plain_{page_size}.db"));
@@ -212,6 +212,22 @@ fn torn_superblock_and_trailing_garbage_recover_cleanly() {
     check_integrity(&ro);
     let cnt: i64 = ro.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
     assert!(cnt >= 2, "expected prior valid generation intact, got {cnt}");
+    drop(ro);
+
+    let rw = open_rw(&db, "").unwrap();
+    rw.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+         INSERT INTO t SELECT i, 'after' FROM n;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(rw);
+    let ro = open_ro(&db).unwrap();
+    check_integrity(&ro);
+    let after: i64 = ro
+        .query_row("SELECT count(*) FROM t WHERE v = 'after'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 1901);
 }
 
 #[test]
@@ -283,41 +299,125 @@ fn compact_api_roundtrip_after_wal_checkpoint() {
 #[test]
 fn pragma_page_size_change_with_vacuum_works_both_directions() {
     register().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("resize.db");
+    for (from, to) in [(16384, 4096), (8192, 4096), (65536, 512), (512, 65536), (4096, 16384)] {
+        for rows in [100i64, 12_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("resize.db");
+            let saved = dir.path().join("saved.db");
+            let check = |conn: &Connection, page_size: i64, want: i64| {
+                check_integrity(conn);
+                let got: (i64, i64, i64) = conn
+                    .query_row(
+                        "SELECT (SELECT page_size FROM pragma_page_size), count(*), sum(id) FROM t \
+                         WHERE v = printf('row-%0100d', id)",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(got, (page_size, want, want * (want + 1) / 2), "{from}->{to}");
+            };
 
-    {
-        let conn = open_rw(&db, "").unwrap();
-        conn.execute_batch(
-            "PRAGMA page_size = 16384;
-             PRAGMA journal_mode = DELETE;
-             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
-             INSERT INTO t SELECT i, 'row-' || i FROM n;
-             PRAGMA page_size = 4096;
-             VACUUM;",
-        )
-        .unwrap();
-        check_integrity(&conn);
-        let ps: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
-        assert_eq!(ps, 4096);
+            let conn = open_rw(&db, "").unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA page_size = {from};
+                 PRAGMA journal_mode = DELETE;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO t SELECT i, printf('row-%0100d', i) FROM n;
+                 PRAGMA page_size = {to};
+                 VACUUM;"
+            ))
+            .unwrap();
+            check(&conn, to, rows);
+            // The size sticks through later writes, in either journal mode, and back again.
+            conn.execute_batch(&format!(
+                "INSERT INTO t VALUES ({rows} + 1, printf('row-%0100d', {rows} + 1));
+                 PRAGMA journal_mode = WAL;
+                 INSERT INTO t VALUES ({rows} + 2, printf('row-%0100d', {rows} + 2));
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            ))
+            .unwrap();
+            drop(conn);
+            check(&open_ro(&db).unwrap(), to, rows + 2);
+            compact(&db, &saved, CompactOptions::default()).unwrap();
+            check(&open_ro(&saved).unwrap(), to, rows + 2);
 
-        conn.execute_batch("PRAGMA page_size = 16384; VACUUM;").unwrap();
-        check_integrity(&conn);
-        let ps2: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
-        assert_eq!(ps2, 16384);
+            let conn = open_rw(&db, "").unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode = DELETE;
+                 PRAGMA page_size = {from};
+                 VACUUM;
+                 INSERT INTO t VALUES ({rows} + 3, printf('row-%0100d', {rows} + 3));"
+            ))
+            .unwrap();
+            drop(conn);
+            check(&open_ro(&db).unwrap(), from, rows + 3);
+        }
     }
+}
 
-    let ro = open_ro(&db).unwrap();
-    check_integrity(&ro);
-    let (ps, cnt): (i64, i64) = ro
-        .query_row(
-            "SELECT (SELECT page_size FROM pragma_page_size), (SELECT count(*) FROM t)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+#[test]
+fn new_databases_larger_than_the_page_cache_work_without_wal() {
+    register().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.db");
+    const FILL: &str = "CREATE TABLE t (x);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400000)
+         INSERT INTO t SELECT i FROM n;";
+    let check = |conn: &Connection, want: i64| {
+        check_integrity(conn);
+        let cnt: i64 = conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, want);
+    };
+
+    // VACUUM INTO, both ways.
+    let conn = Connection::open(&plain).unwrap();
+    conn.execute_batch(FILL).unwrap();
+    let into = dir.path().join("into.db");
+    conn.execute("VACUUM INTO ?1", [format!("{}?vfs={VFS_NAME}", uri(&into).unwrap())])
         .unwrap();
-    assert_eq!((ps, cnt), (16384, 1000));
+    let back = dir.path().join("back.db");
+    let os_vfs = if cfg!(windows) { "win32" } else { "unix" };
+    let ro = open_ro(&into).unwrap();
+    check(&ro, 400_000);
+    ro.execute("VACUUM INTO ?1", [format!("{}?vfs={os_vfs}", uri(&back).unwrap())])
+        .unwrap();
+    check(&Connection::open(&back).unwrap(), 400_000);
+
+    // One big transaction, rolled back and committed.
+    let direct = dir.path().join("direct.db");
+    let conn = open_rw(&direct, "").unwrap();
+    conn.execute_batch(&format!("BEGIN; {FILL} ROLLBACK;")).unwrap();
+    conn.execute_batch(&format!("BEGIN; {FILL} COMMIT;")).unwrap();
+    drop(conn);
+    check(&open_ro(&direct).unwrap(), 400_000);
+}
+
+#[test]
+fn compact_refuses_leftover_wal_and_journal_files() {
+    register().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("live.db");
+    let dst = dir.path().join("saved.db");
+    open_rw(&src, "").unwrap().execute_batch("CREATE TABLE t (x);").unwrap();
+    for (name, content, ok) in [
+        ("live.db-wal", &b"frames"[..], false),
+        ("live.db-journal", b"hot", false),
+        ("saved.db-wal", b"frames", false),
+        ("saved.db-journal", b"hot", false),
+        ("live.db-wal", b"", true),
+        ("live.db-journal", b"\0persisted", true),
+        ("saved.db-journal", b"", true),
+    ] {
+        let leftover = dir.path().join(name);
+        std::fs::write(&leftover, content).unwrap();
+        let res = compact(&src, &dst, CompactOptions::default());
+        assert_eq!(res.is_ok(), ok, "{name}: {res:?}");
+        assert_eq!(dst.exists(), ok, "{name}");
+        assert_eq!(std::fs::read(&leftover).unwrap(), content);
+        std::fs::remove_file(&leftover).unwrap();
+        let _ = std::fs::remove_file(&dst);
+    }
 }
 
 #[test]
@@ -355,7 +455,7 @@ fn open_without_uri_flag_uses_default_config_safely() {
 }
 
 #[test]
-fn concurrent_open_and_rollback_reads_during_live_compaction_do_not_corrupt() {
+fn concurrent_opens_and_reads_during_live_compaction_do_not_corrupt() {
     register().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("compact_race.db");
@@ -389,23 +489,25 @@ fn concurrent_open_and_rollback_reads_during_live_compaction_do_not_corrupt() {
     let stop_reader = stop.clone();
     let reader_thread = std::thread::spawn(move || {
         // Repeatedly open fresh connections & query while writer triggers live compaction cycles.
-        for _ in 0..80 {
-            if stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            if let Ok(conn) = open_ro(&db_reader) {
-                let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
-                if let Err(e) = conn.query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0)) {
-                    let code = e.sqlite_error_code();
-                    assert!(
-                        matches!(
-                            code,
-                            Some(rusqlite::ErrorCode::DatabaseBusy)
-                                | Some(rusqlite::ErrorCode::DatabaseLocked)
-                        ),
-                        "reader hit fatal error during live compaction: {e}"
-                    );
+        while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+            let res = open_ro(&db_reader).and_then(|conn| {
+                conn.busy_timeout(std::time::Duration::from_millis(200))?;
+                conn.query_row("SELECT count(*), total(length(b)) FROM blobs", [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                })
+            });
+            match res {
+                Ok((rows, bytes)) => {
+                    assert!(rows == 0 || rows == 350, "saw {rows} rows");
+                    assert_eq!(bytes, rows as f64 * 15_000.0);
                 }
+                Err(e) => assert!(
+                    matches!(
+                        e.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                    ),
+                    "reader hit fatal error during live compaction: {e}"
+                ),
             }
         }
     });
@@ -428,4 +530,17 @@ fn concurrent_open_and_rollback_reads_during_live_compaction_do_not_corrupt() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     reader_thread.join().unwrap();
     check_integrity(&writer);
+
+    // With nobody reading, the space of a cleared recording must come back (on Windows only).
+    writer
+        .execute_batch("DELETE FROM blobs; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let mut superblocks = [0u8; 8192];
+    std::fs::File::open(&db).unwrap().read_exact(&mut superblocks).unwrap();
+    let compact_id = |slot: usize| {
+        u64::from_le_bytes(superblocks[slot + 72..slot + 80].try_into().unwrap())
+    };
+    if cfg!(windows) {
+        assert!(compact_id(0).max(compact_id(4096)) > 0, "live compaction never ran");
+    }
 }
