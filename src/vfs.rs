@@ -933,7 +933,9 @@ unsafe extern "C" fn io_file_control(
             }
             ffi::SQLITE_FCNTL_CKPT_DONE => {
                 state.checkpoint_copied = true;
-                if let Err(e) = state.store.flush(false) {
+                // Synced, as SQLite may count the frames as copied from here on. A partial checkpoint
+                // has no sync of its own.
+                if let Err(e) = state.store.flush(true) {
                     // SQLite ignores this result. If the checkpoint is complete, it truncates next,
                     // which then reports the failure instead of retrying: after a failed sync, the
                     // data may never reach the disk unless it is written again. If the checkpoint is

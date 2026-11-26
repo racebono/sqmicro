@@ -590,9 +590,17 @@ impl<B: BlockIo> PageStore<B> {
     /// Must run before anything is written past the tail of the current superblock, if that may not
     /// be on the disk. If it ends a compaction that was cut short, its tail is lower than that of the
     /// superblock a crash would fall back to, whose data is then still needed.
-    fn sync_base(&mut self) -> Result<()> {
+    ///
+    /// Writing also starts past the end of the file. Space there may belong to a superblock that a
+    /// failed sync lost, and other connections may have cached it. Only compaction reuses space,
+    /// and it tells them to drop their caches.
+    fn prepare_append(&mut self) -> Result<()> {
         if self.base_unsynced {
             self.sync()?;
+        }
+        let end = self.io.file_size()?;
+        if end > self.staged_tail_offset {
+            self.staged_tail_offset = align16(end);
         }
         Ok(())
     }
@@ -681,7 +689,7 @@ impl<B: BlockIo> PageStore<B> {
         let live_bytes = self.live_bytes(new_page_count, trimmed_last_l2.as_ref())?;
 
         // Logical truncate (safe with concurrent readers; no live bytes overwritten).
-        self.sync_base()?;
+        self.prepare_append()?;
         let mut new_l1 = self.l1[..new_l1_entries.min(self.l1.len())].to_vec();
         new_l1.resize(new_l1_entries, 0);
         let mut tail = self.staged_tail_offset;
@@ -873,6 +881,7 @@ impl<B: BlockIo> PageStore<B> {
             self.config.threads,
         )?;
 
+        self.prepare_append()?;
         let old_tail = self.staged_tail_offset;
         let l1_entries = self.l1.len() as u64;
         let packed_bytes = chunks.iter().map(|c| c.block.len() as u64).sum::<u64>()
@@ -993,7 +1002,7 @@ impl<B: BlockIo> PageStore<B> {
             self.sync()?;
             self.superblock = Some(init_sb);
         }
-        self.sync_base()?;
+        self.prepare_append()?;
 
         let page_size = self.staged_page_size;
         let max_pages = self.chunk_pages_limit(page_size);
@@ -1978,7 +1987,7 @@ mod tests {
                     // Another connection, that will write next.
                     let mut reader = PageStore::open(io.clone(), Config::default(), false).unwrap();
                     contents(&mut reader).unwrap();
-                    reader.sync_base().unwrap();
+                    reader.prepare_append().unwrap();
                     io.0.borrow_mut().fail_op = Some((op, takes_effect));
                     let _ = store.truncate(40 * PS as u64, Some(&lock));
                     let failed = io.0.borrow_mut().fail_op.take().is_none();
@@ -2160,6 +2169,51 @@ mod tests {
             r.refresh().unwrap();
             assert_eq!(contents(&mut r).unwrap(), truth);
         }
+    }
+
+    /// A writer loses a superblock and goes back to the one before; a reader that read through the
+    /// lost one then sees what the writer publishes next.
+    fn reader_after_lost_superblock(lost: &[u64], next: &[&[u64]]) {
+        let io = CrashIo::default();
+        let mut w = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut w, pgno, pgno);
+        }
+        w.flush(true).unwrap();
+        for &pgno in lost {
+            put(&mut w, pgno, 100 + pgno);
+        }
+        w.flush(false).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(w.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        let mut r = PageStore::open(io.clone(), Config::default(), true).unwrap();
+        contents(&mut r).unwrap();
+        evict_superblock(&io, &w);
+        w.refresh().unwrap();
+        for (i, pages) in next.iter().enumerate() {
+            for &pgno in *pages {
+                put(&mut w, pgno, 1000 * (i as u64 + 2) + pgno);
+            }
+            w.flush(true).unwrap();
+        }
+        let truth = reopened(&io.0.borrow().current);
+        r.mark_stale();
+        r.refresh().unwrap();
+        assert_eq!(contents(&mut r).unwrap(), truth);
+    }
+
+    #[test]
+    fn reader_that_skips_generations_after_a_lost_superblock_reads_the_file() {
+        let all: Vec<u64> = (1..=40).collect();
+        reader_after_lost_superblock(&all, &[&all[..20], &all[20..]]);
+    }
+
+    #[test]
+    fn superblock_republished_like_a_lost_one_is_still_read_again() {
+        // The same pages at the same sizes: the superblock would be the same, given the same space.
+        let pages: Vec<u64> = (2..=40).collect();
+        reader_after_lost_superblock(&pages, &[&pages]);
     }
 
     #[test]

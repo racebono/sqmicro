@@ -132,7 +132,7 @@ Open the source connection with `SQLITE_OPEN_URI`, and register sqmicro first.
 
 ## Benchmarks
 
-These results come from replaying a real 106-minute race (14 cars, 13.3 million rows, 2.7 GiB) on one Windows machine. They predate format version 2, and the extra fsync that each checkpoint has needed since to survive a power loss.
+These results come from replaying a real 106-minute race (14 cars, 13.3 million rows, 2.7 GiB) on one Windows machine. They predate format version 2, and the extra fsyncs that each checkpoint has needed since to survive a power loss or a failed sync.
 
 | | Size | vs original | Write time | After `compact` |
 | --- | ---: | ---: | ---: | ---: |

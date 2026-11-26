@@ -17,6 +17,8 @@ thread_local! {
     static FAIL_NEXT_SYNC: Cell<bool> = const { Cell::new(false) };
     /// Fails this thread's syncs of main database files whose bit is set, counting from bit 0.
     static FAIL_SYNCS: Cell<u32> = const { Cell::new(0) };
+    /// The superblocks of the last main database file this thread synced, as synced.
+    static SYNCED_SUPERBLOCKS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// Lets this many of this thread's syncs of main database files through, then fails them.
     static SYNCS_LEFT: Cell<u32> = const { Cell::new(u32::MAX) };
     /// Runs once, right after this thread's connection has locked a WAL read mark.
@@ -140,7 +142,13 @@ unsafe extern "C" fn os_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_in
         n => SYNCS_LEFT.set(n - 1),
     }
     let original = OS.get().unwrap().original.get().unwrap();
-    unsafe { original.xSync.unwrap()(file, flags) }
+    let rc = unsafe { original.xSync.unwrap()(file, flags) };
+    if rc == ffi::SQLITE_OK {
+        let mut region = vec![0u8; 8192];
+        unsafe { original.xRead.unwrap()(file, region.as_mut_ptr().cast(), 8192, 0) };
+        SYNCED_SUPERBLOCKS.set(region);
+    }
+    rc
 }
 
 unsafe extern "C" fn sqmicro_open(
@@ -797,6 +805,62 @@ fn commit_across_databases_is_whole_or_absent_after_failed_syncs() {
         assert_intact(&other);
     }
     assert!(failures > 100, "only {failures} failures");
+}
+
+#[test]
+fn superblock_lost_after_a_partial_checkpoint_loses_no_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let writer = wal_database(&db);
+    writer.execute_batch("UPDATE t SET v = 2").unwrap();
+    let old_reader = open(&db);
+    old_reader.execute_batch("BEGIN").unwrap();
+    assert_eq!(int(&old_reader, "SELECT v FROM t"), 2);
+    writer
+        .execute_batch("INSERT INTO other VALUES (1)")
+        .unwrap();
+
+    // Partial: copies the UPDATE, and SQLite counts its frames as copied.
+    let (busy, log, done) = writer
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap();
+    assert!(
+        busy == 0 && done > 0 && done < log,
+        "not partial: {busy} {log} {done}"
+    );
+    old_reader.execute_batch("COMMIT").unwrap();
+
+    // The next checkpoint's sync fails, and the file then shows what the disk has.
+    FAIL_NEXT_SYNC.set(true);
+    assert!(
+        writer
+            .query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))
+            .is_err()
+    );
+    assert!(!FAIL_NEXT_SYNC.take());
+    {
+        use std::io::Write;
+        let synced = SYNCED_SUPERBLOCKS.take();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.write_all(&synced).unwrap();
+    }
+    writer
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            assert_eq!(r.get::<_, i64>(0)?, 0);
+            Ok(())
+        })
+        .unwrap();
+    drop((writer, old_reader));
+    let reopened = open(&db);
+    assert_eq!(int(&reopened, "SELECT count(*) FROM other"), 1);
+    assert_eq!(int(&reopened, "SELECT v FROM t"), 2);
+    assert_intact(&reopened);
 }
 
 #[test]
