@@ -356,6 +356,8 @@ struct SqmicroFileState {
     wal_index: *mut c_void,
     /// A checkpoint whose flush failed, until SQLite has been told.
     failed_checkpoint: Option<FailedCheckpoint>,
+    /// A checkpoint has copied its pages, and its truncate may come next.
+    checkpoint_copied: bool,
 }
 
 struct FailedCheckpoint {
@@ -566,6 +568,7 @@ unsafe extern "C" fn vfs_open(
             shared_lock_count: 0,
             wal_index: std::ptr::null_mut(),
             failed_checkpoint: None,
+            checkpoint_copied: false,
         });
 
         let slot = p_file.cast::<SqmicroFileSlot>();
@@ -780,7 +783,15 @@ unsafe extern "C" fn io_truncate(
         if let Some(failed) = state.failed_checkpoint.take() {
             return failed.rc;
         }
-        match state.store.truncate(size as u64, state.compact_lock.as_ref()) {
+        // A checkpoint's truncate is published at once: the WAL still has its pages. Any other is
+        // part of a rollback-journal commit or rollback, and only published with it, at the next
+        // FCNTL_SYNC or FCNTL_COMMIT_PHASETWO.
+        let res = if std::mem::take(&mut state.checkpoint_copied) {
+            state.store.truncate(size as u64, state.compact_lock.as_ref())
+        } else {
+            state.store.truncate_later(size as u64)
+        };
+        match res {
             Ok(()) => ffi::SQLITE_OK,
             Err(e) => err_to_sqlite(e, ffi::SQLITE_IOERR_TRUNCATE),
         }
@@ -840,6 +851,10 @@ unsafe extern "C" fn io_lock(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c
         if rc == ffi::SQLITE_OK && e_lock == ffi::SQLITE_LOCK_EXCLUSIVE {
             state.store.mark_stale();
         }
+        // Rollback-journal transactions and recoveries take these, and checkpoints don't.
+        if rc == ffi::SQLITE_OK && e_lock >= ffi::SQLITE_LOCK_RESERVED {
+            state.checkpoint_copied = false;
+        }
         if rc == ffi::SQLITE_OK
             && e_lock == ffi::SQLITE_LOCK_SHARED
             && !state.store.has_pending_writes()
@@ -896,10 +911,12 @@ unsafe extern "C" fn io_file_control(
         let state = state_mut(p_file);
         // Commits always get here before the journal is finalized, unlike xSync, which
         // `synchronous=OFF` skips.
-        if op == ffi::SQLITE_FCNTL_SYNC
-            && let Err(e) = state.store.flush(false)
-        {
-            return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+        // COMMIT_PHASETWO follows the truncate at the end of a rollback-journal commit.
+        if op == ffi::SQLITE_FCNTL_SYNC || op == ffi::SQLITE_FCNTL_COMMIT_PHASETWO {
+            if let Err(e) = state.store.flush(false) {
+                return err_to_sqlite(e, ffi::SQLITE_IOERR_WRITE);
+            }
+            state.store.compact_if_truncated(state.compact_lock.as_ref());
         }
         match op {
             ffi::SQLITE_FCNTL_SIZE_HINT | ffi::SQLITE_FCNTL_CHUNK_SIZE => ffi::SQLITE_OK,
@@ -915,6 +932,7 @@ unsafe extern "C" fn io_file_control(
                 ffi::SQLITE_OK
             }
             ffi::SQLITE_FCNTL_CKPT_DONE => {
+                state.checkpoint_copied = true;
                 if let Err(e) = state.store.flush(false) {
                     // SQLite ignores this result. If the checkpoint is complete, it truncates next,
                     // which then reports the failure instead of retrying: after a failed sync, the

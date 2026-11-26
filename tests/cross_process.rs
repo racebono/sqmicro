@@ -316,10 +316,12 @@ fn cross_process_wal_writer_with_spotter_engineer_and_clear() {
         let paused = paused.clone();
         let clearing = clearing_path.clone();
         let cleared = cleared_path.clone();
+        let stop = stop.clone();
+        // Until the child has cleared, or exited without doing so.
         move || {
             if clearing.exists() && !cleared.exists() {
                 paused.fetch_add(1, Ordering::SeqCst);
-                while !cleared.exists() {
+                while !cleared.exists() && !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }

@@ -132,8 +132,8 @@ pub struct PageStore<B: BlockIo> {
     /// The current superblock may not be on the disk because it was written since the last sync,
     /// or for a reason in `base_unsynced`. A failed sync through another handle can lose it.
     superblock_unsynced: bool,
-    /// The last sync failed.
-    sync_failed: bool,
+    /// A truncation is staged that may leave enough dead space to compact.
+    may_compact: bool,
     /// A sync failed after pages were spilled, so they may never reach the disk.
     spills_unsure: bool,
 
@@ -157,7 +157,7 @@ impl<B: BlockIo> PageStore<B> {
             read_only,
             base_unsynced: superblock.is_some(),
             superblock_unsynced: superblock.is_some(),
-            sync_failed: false,
+            may_compact: false,
             spills_unsure: false,
             superblock,
             l1,
@@ -200,6 +200,7 @@ impl<B: BlockIo> PageStore<B> {
         self.staged_header = None;
         self.has_unflushed_spills = false;
         self.spills_unsure = false;
+        self.may_compact = false;
         // Spilled chunks may be cached under offsets that the next writer will use.
         self.chunk_cache.clear();
         self.reset_staged();
@@ -625,7 +626,6 @@ impl<B: BlockIo> PageStore<B> {
         let failed = res.is_err();
         self.base_unsynced = failed;
         self.superblock_unsynced = failed;
-        self.sync_failed = failed;
         if failed && self.has_unflushed_spills {
             self.spills_unsure = true;
         }
@@ -652,10 +652,6 @@ impl<B: BlockIo> PageStore<B> {
             return self.truncate_staged(new_size);
         }
         self.refresh()?;
-        // As when a commit published, but then failed to sync, and is being rolled back.
-        if self.sync_failed {
-            return self.truncate_staged(new_size);
-        }
 
         let (page_size, old_page_count) = self.current_geometry();
         if page_size == 0 {
@@ -801,6 +797,31 @@ impl<B: BlockIo> PageStore<B> {
         Ok(bytes
             .saturating_add(l1_entries.saturating_mul(L2_PAGE_SIZE as u64))
             .saturating_add(align16(l1_entries * 8)))
+    }
+
+    /// Truncates for the next flush to publish, then `compact_if_truncated` to compact. For
+    /// rollback-journal mode, where a commit or rollback that fails may otherwise have published a
+    /// truncation without the pages that go with it.
+    pub fn truncate_later(&mut self, new_size: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::InvalidConfig(
+                "cannot truncate a read-only sqmicro database".into(),
+            ));
+        }
+        if !self.has_pending_writes() {
+            self.refresh()?;
+        }
+        let pages = self.staged_page_count;
+        self.truncate_staged(new_size)?;
+        self.may_compact |= self.staged_page_count < pages;
+        Ok(())
+    }
+
+    /// Compacts if a truncation since the last call allows it, once it has been published.
+    pub fn compact_if_truncated(&mut self, lock: Option<&crate::lock::CompactLock>) {
+        if !self.has_pending_writes() && std::mem::take(&mut self.may_compact) {
+            self.compact_if_worthwhile(lock);
+        }
     }
 
     /// Compacts the database in place if that is cheap and reclaims enough. Best effort: if it

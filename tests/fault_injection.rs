@@ -693,7 +693,7 @@ fn compaction_waits_for_readers_and_moves_pages_under_idle_ones() {
     }
 }
 
-/// Rollback-mode commits shrink the file once the journal is finalized, with nothing staged.
+/// Rollback-mode commits shrink the file once the journal is finalized, and compact after it.
 #[cfg(windows)]
 #[test]
 fn rollback_mode_commits_compact_the_file() {
@@ -754,6 +754,49 @@ fn commit_without_a_journal_file_is_whole_or_absent_after_failed_syncs() {
         );
         assert_intact(&other);
     }
+}
+
+#[test]
+fn commit_across_databases_is_whole_or_absent_after_failed_syncs() {
+    let mut failures = 0;
+    for mask in 1..256u32 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let conn = open(&db);
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode = MEMORY;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+             INSERT INTO t SELECT i, zeroblob(500) FROM n;
+             ATTACH '{}?vfs={VFS_NAME}' AS b;
+             CREATE TABLE b.u (v INTEGER);",
+            uri(&dir.path().join("b.db")).unwrap()
+        ))
+        .unwrap();
+        // Among them those of the other database, which can fail after this one has committed.
+        FAIL_SYNCS.set(mask);
+        let res = conn.execute_batch(
+            "BEGIN;
+             UPDATE t SET v = randomblob(500);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO t SELECT i + 200, randomblob(500) FROM n;
+             INSERT INTO b.u VALUES (1);
+             COMMIT;",
+        );
+        FAIL_SYNCS.set(0);
+        if res.is_err() {
+            failures += 1;
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        drop(conn);
+        let other = open(&db);
+        let rows = int(&other, "SELECT count(*) FROM t");
+        let old = int(&other, "SELECT count(*) FROM t WHERE v = zeroblob(500)");
+        let whole = (rows, old) == (200, 200) || (rows, old) == (2200, 0);
+        assert!(whole, "{mask:b}: {rows} {old}");
+        assert_intact(&other);
+    }
+    assert!(failures > 100, "only {failures} failures");
 }
 
 #[test]
