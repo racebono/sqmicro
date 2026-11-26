@@ -233,21 +233,21 @@ impl<B: BlockIo> PageStore<B> {
             return Ok(());
         };
 
-        let same_gen = self.superblock.as_ref().is_some_and(|old| {
-            old.generation == new_sb.generation && old.compact_id == new_sb.compact_id
-        });
-        if same_gen {
+        if self.superblock.as_ref() == Some(&new_sb) {
             self.stale = false;
             return Ok(());
         }
 
-        let compacted = self
-            .superblock
-            .as_ref()
-            .is_some_and(|old| old.compact_id != new_sb.compact_id);
+        // Offsets can be reused after a compaction, and also after a superblock was lost by a
+        // failed sync and the file went back to an older one.
+        let offsets_reused = self.superblock.as_ref().is_some_and(|old| {
+            old.compact_id != new_sb.compact_id
+                || new_sb.generation <= old.generation
+                || new_sb.tail_offset < old.tail_offset
+        });
         let new_l1 = read_l1(&mut self.io, &new_sb)?;
 
-        if compacted {
+        if offsets_reused {
             self.l2_cache.clear();
             self.chunk_cache.clear();
         } else {
@@ -606,12 +606,16 @@ impl<B: BlockIo> PageStore<B> {
         {
             let encoded = sb.encode();
             let mut slot = [0u8; SUPERBLOCK_SIZE];
-            if self.io.read_at(sb.slot_offset(), &mut slot)? == SUPERBLOCK_SIZE && slot == encoded {
+            let n = self.io.read_at(sb.slot_offset(), &mut slot)?;
+            let replaced =
+                Superblock::decode(&slot).is_some_and(|it| it.generation > sb.generation);
+            if n == SUPERBLOCK_SIZE && slot == encoded {
                 self.io.write_at(sb.slot_offset(), &encoded)?;
-            } else if self.base_unsynced {
+            } else if self.base_unsynced || !replaced {
                 // Gone from the file without having reached the disk, or replaced by another
-                // process. Either way, what is there has to be read again.
-                self.stale = true;
+                // process. Either way, what is there has to be read again, and nothing that builds
+                // on this one can be published.
+                self.discard_staged();
                 return Err(Error::Io(std::io::Error::other(
                     "the superblock changed while it was in use",
                 )));
@@ -2083,6 +2087,119 @@ mod tests {
         a.refresh().unwrap();
         assert_eq!(contents(&mut a).unwrap(), [3]);
         assert_eq!(reopened(&io.0.borrow().current), [3]);
+    }
+
+    /// What the file shows of a superblock that a failed sync lost: what the disk has.
+    fn evict_superblock(io: &CrashIo, store: &PageStore<CrashIo>) {
+        let at = store.superblock().unwrap().slot_offset() as usize;
+        let mut s = io.0.borrow_mut();
+        let mut slot = vec![0u8; SUPERBLOCK_SIZE];
+        if let Some(durable) = s.durable.get(at..at + SUPERBLOCK_SIZE) {
+            slot.copy_from_slice(durable);
+        }
+        s.current[at..at + SUPERBLOCK_SIZE].copy_from_slice(&slot);
+    }
+
+    #[test]
+    fn lost_superblock_leaves_no_stale_caches() {
+        for reader_refreshes in [false, true] {
+            let io = CrashIo::default();
+            let mut w = PageStore::open(io.clone(), Config::default(), false).unwrap();
+            for pgno in 1..=40 {
+                put(&mut w, pgno, pgno);
+            }
+            w.flush(true).unwrap();
+            for pgno in 1..=40 {
+                put(&mut w, pgno, 100 + pgno);
+            }
+            w.flush(false).unwrap();
+            io.0.borrow_mut().fail_sync = true;
+            assert!(w.flush(true).is_err());
+            io.0.borrow_mut().fail_sync = false;
+            // Both cache the pages of the superblock that is about to be lost.
+            let mut r = PageStore::open(io.clone(), Config::default(), true).unwrap();
+            let lost: Vec<u64> = (101..=140).collect();
+            assert_eq!(contents(&mut r).unwrap(), lost);
+            assert_eq!(contents(&mut w).unwrap(), lost);
+
+            evict_superblock(&io, &w);
+            if reader_refreshes {
+                r.refresh().unwrap();
+            }
+            // The next checkpoint goes back to the older superblock, and reuses the space.
+            w.refresh().unwrap();
+            for pgno in 1..=20 {
+                put(&mut w, pgno, 200 + pgno);
+            }
+            w.flush(true).unwrap();
+            let truth = reopened(&io.0.borrow().current);
+            assert_eq!(truth[..20], (201..=220).collect::<Vec<_>>());
+            assert_eq!(contents(&mut w).unwrap(), truth);
+            r.mark_stale();
+            r.refresh().unwrap();
+            assert_eq!(contents(&mut r).unwrap(), truth);
+        }
+    }
+
+    #[test]
+    fn rollback_succeeds_after_its_superblock_was_lost() {
+        let io = CrashIo::default();
+        let mut w = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut w, pgno, pgno);
+        }
+        w.flush(true).unwrap();
+        let old = contents(&mut w).unwrap();
+        // The commit publishes, then its sync fails.
+        for pgno in 1..=40 {
+            put(&mut w, pgno, 100 + pgno);
+        }
+        w.flush(false).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(w.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        evict_superblock(&io, &w);
+        // The rollback, and in exclusive locking mode nothing unlocks after it fails. The next
+        // statement rolls back again.
+        let mut failures = 0;
+        loop {
+            for pgno in 1..=40 {
+                put(&mut w, pgno, pgno);
+            }
+            w.truncate(40 * PS as u64, None).unwrap();
+            if w.flush(false).is_ok() && w.flush(true).is_ok() {
+                break;
+            }
+            failures += 1;
+            assert!(failures < 2, "the rollback keeps failing");
+        }
+        assert_eq!(contents(&mut w).unwrap(), old);
+        assert_eq!(reopened(&io.0.borrow().durable), old);
+    }
+
+    #[test]
+    fn superblock_lost_through_another_handle_and_the_cache_is_not_built_on() {
+        let io = CrashIo::default();
+        let mut a = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut a, pgno, pgno);
+        }
+        a.flush(true).unwrap();
+        let mut b = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        for pgno in 1..=40 {
+            put(&mut a, pgno, 100 + pgno);
+        }
+        a.flush(false).unwrap();
+        io.0.borrow_mut().fail_sync = true;
+        assert!(b.flush(true).is_err());
+        io.0.borrow_mut().fail_sync = false;
+        // Once pages are staged, a doesn't look at the superblock again before publishing.
+        put(&mut a, 41, 41);
+        evict_superblock(&io, &a);
+        assert!(a.flush(false).is_err());
+        assert!(!a.has_pending_writes());
+        a.refresh().unwrap();
+        assert_eq!(contents(&mut a).unwrap(), reopened(&io.0.borrow().current));
     }
 
     #[test]
