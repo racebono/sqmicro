@@ -2034,6 +2034,23 @@ mod tests {
     }
 
     #[test]
+    fn superblock_is_not_written_again_over_a_newer_one() {
+        let io = CrashIo::default();
+        let mut a = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        put(&mut a, 1, 1);
+        a.flush(true).unwrap();
+        let mut b = PageStore::open(io.clone(), Config::default(), false).unwrap();
+        a.discard_staged();
+        // Two, so that the slot of a's superblock holds a newer one.
+        for tag in [2, 3] {
+            put(&mut b, 1, tag);
+            b.flush(true).unwrap();
+        }
+        a.flush(true).unwrap();
+        assert_eq!(reopened(&io.0.borrow().current), [3]);
+    }
+
+    #[test]
     fn superblock_lost_by_a_failed_sync_is_written_again() {
         for more_pages in [false, true] {
             let io = CrashIo::default();
@@ -2190,6 +2207,9 @@ mod tests {
             let old = contents(&mut store).unwrap();
             for pgno in 500..=700 {
                 put(&mut store, pgno, 10_000 + pgno);
+            }
+            if new_pages == 0 {
+                put(&mut store, 1, 1);
             }
             if spill {
                 store.spill_pending_chunks().unwrap();
